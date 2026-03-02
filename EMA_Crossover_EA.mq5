@@ -3,10 +3,11 @@
 //|                                          Copyright 2026            |
 //|                  EMA 9/33 Crossover with Candle Structure Filter   |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v1.0"
-#property version   "1.00"
+#property copyright "EMA Crossover EA v1.1"
+#property version   "1.10"
 #property description "EMA 9/33 Crossover Strategy with Candle Structure Filter"
 #property description "Designed for Gold (XAUUSD) on M1 timeframe"
+#property description "Supports up to 40 lot size tiers for Buy and Sell"
 
 #include <Trade\Trade.mqh>
 
@@ -34,39 +35,32 @@ input double   Default_Lot       = 0.01;       // Default Lot Size (if no tier m
 input int      Magic_Number      = 202601;     // Magic Number
 input int      Max_Slippage      = 30;         // Maximum Slippage (points)
 
-input group "══════ Sell Lot Tiers (High-to-Close distance in points) ══════"
-input double   Sell_T1_MinPts    = 0;          // Tier 1: Min Points
-input double   Sell_T1_MaxPts    = 100;        // Tier 1: Max Points
-input double   Sell_T1_Lot       = 0.01;       // Tier 1: Lot Size
-input double   Sell_T2_MinPts    = 100;        // Tier 2: Min Points
-input double   Sell_T2_MaxPts    = 200;        // Tier 2: Max Points
-input double   Sell_T2_Lot       = 0.02;       // Tier 2: Lot Size
-input double   Sell_T3_MinPts    = 200;        // Tier 3: Min Points
-input double   Sell_T3_MaxPts    = 300;        // Tier 3: Max Points
-input double   Sell_T3_Lot       = 0.03;       // Tier 3: Lot Size
-input double   Sell_T4_MinPts    = 300;        // Tier 4: Min Points
-input double   Sell_T4_MaxPts    = 500;        // Tier 4: Max Points
-input double   Sell_T4_Lot       = 0.05;       // Tier 4: Lot Size
-input double   Sell_T5_MinPts    = 500;        // Tier 5: Min Points
-input double   Sell_T5_MaxPts    = 10000;      // Tier 5: Max Points
-input double   Sell_T5_Lot       = 0.10;       // Tier 5: Lot Size
+//--- Sell Lot Tiers: Format per entry is  minPts-maxPts:lotSize
+//--- Example: 0-100:0.01, 100-200:0.02, 200-300:0.05
+//--- Split across 4 boxes (up to 10 tiers each = 40 total)
 
-input group "══════ Buy Lot Tiers (Low-to-Close distance in points) ══════"
-input double   Buy_T1_MinPts     = 0;          // Tier 1: Min Points
-input double   Buy_T1_MaxPts     = 100;        // Tier 1: Max Points
-input double   Buy_T1_Lot        = 0.01;       // Tier 1: Lot Size
-input double   Buy_T2_MinPts     = 100;        // Tier 2: Min Points
-input double   Buy_T2_MaxPts     = 200;        // Tier 2: Max Points
-input double   Buy_T2_Lot        = 0.02;       // Tier 2: Lot Size
-input double   Buy_T3_MinPts     = 200;        // Tier 3: Min Points
-input double   Buy_T3_MaxPts     = 300;        // Tier 3: Max Points
-input double   Buy_T3_Lot        = 0.03;       // Tier 3: Lot Size
-input double   Buy_T4_MinPts     = 300;        // Tier 4: Min Points
-input double   Buy_T4_MaxPts     = 500;        // Tier 4: Max Points
-input double   Buy_T4_Lot        = 0.05;       // Tier 4: Lot Size
-input double   Buy_T5_MinPts     = 500;        // Tier 5: Min Points
-input double   Buy_T5_MaxPts     = 10000;      // Tier 5: Max Points
-input double   Buy_T5_Lot        = 0.10;       // Tier 5: Lot Size
+input group "══════ Sell Lot Tiers (High-to-Close pts) ══════"
+input string   Sell_Tiers_1  = "0-50:0.01, 50-100:0.02, 100-150:0.03, 150-200:0.04, 200-250:0.05, 250-300:0.06, 300-350:0.07, 350-400:0.08, 400-450:0.09, 450-500:0.10";  // Sell Tiers 1-10
+input string   Sell_Tiers_2  = "";  // Sell Tiers 11-20
+input string   Sell_Tiers_3  = "";  // Sell Tiers 21-30
+input string   Sell_Tiers_4  = "";  // Sell Tiers 31-40
+
+input group "══════ Buy Lot Tiers (Low-to-Close pts) ══════"
+input string   Buy_Tiers_1   = "0-50:0.01, 50-100:0.02, 100-150:0.03, 150-200:0.04, 200-250:0.05, 250-300:0.06, 300-350:0.07, 350-400:0.08, 400-450:0.09, 450-500:0.10";  // Buy Tiers 1-10
+input string   Buy_Tiers_2   = "";  // Buy Tiers 11-20
+input string   Buy_Tiers_3   = "";  // Buy Tiers 21-30
+input string   Buy_Tiers_4   = "";  // Buy Tiers 31-40
+
+//+------------------------------------------------------------------+
+//| Lot Tier Structure                                                 |
+//+------------------------------------------------------------------+
+
+struct LotTier
+{
+   double minPts;
+   double maxPts;
+   double lotSize;
+};
 
 //+------------------------------------------------------------------+
 //| Global Variables                                                   |
@@ -81,6 +75,110 @@ int      g_crossDir       = 0;     // 1 = sell signal, -1 = buy signal, 0 = none
 int      g_barsSinceCross = 0;
 bool     g_tradeTaken     = false;
 int      g_prevEMARelation= 0;     // 1 = slow > fast, -1 = slow < fast
+
+LotTier  g_sellTiers[];
+LotTier  g_buyTiers[];
+int      g_sellTierCount  = 0;
+int      g_buyTierCount   = 0;
+
+//+------------------------------------------------------------------+
+//| Parse a single tier string into the tier array                     |
+//| Format: "minPts-maxPts:lotSize, minPts-maxPts:lotSize, ..."       |
+//+------------------------------------------------------------------+
+bool ParseTierString(string tierStr, LotTier &tiers[], int &count)
+{
+   StringTrimLeft(tierStr);
+   StringTrimRight(tierStr);
+
+   if(StringLen(tierStr) == 0)
+      return true;  // Empty string is OK, skip
+
+   string entries[];
+   int numEntries = StringSplit(tierStr, ',', entries);
+
+   for(int i = 0; i < numEntries; i++)
+   {
+      string entry = entries[i];
+      StringTrimLeft(entry);
+      StringTrimRight(entry);
+
+      if(StringLen(entry) == 0) continue;
+
+      //--- Find the '-' between min and max
+      int dashPos = StringFind(entry, "-");
+      if(dashPos <= 0)
+      {
+         Print("WARNING: Invalid tier format (no dash): ", entry);
+         continue;
+      }
+
+      //--- Find the ':' between max and lot size
+      int colonPos = StringFind(entry, ":");
+      if(colonPos <= 0 || colonPos <= dashPos)
+      {
+         Print("WARNING: Invalid tier format (no colon): ", entry);
+         continue;
+      }
+
+      //--- Extract the three values
+      string minStr = StringSubstr(entry, 0, dashPos);
+      string maxStr = StringSubstr(entry, dashPos + 1, colonPos - dashPos - 1);
+      string lotStr = StringSubstr(entry, colonPos + 1);
+
+      StringTrimLeft(minStr);  StringTrimRight(minStr);
+      StringTrimLeft(maxStr);  StringTrimRight(maxStr);
+      StringTrimLeft(lotStr);  StringTrimRight(lotStr);
+
+      double minVal = StringToDouble(minStr);
+      double maxVal = StringToDouble(maxStr);
+      double lotVal = StringToDouble(lotStr);
+
+      if(maxVal <= minVal || lotVal <= 0)
+      {
+         Print("WARNING: Invalid tier values: min=", minVal, " max=", maxVal, " lot=", lotVal);
+         continue;
+      }
+
+      //--- Add to array
+      int idx = count;
+      count++;
+      ArrayResize(tiers, count);
+
+      tiers[idx].minPts  = minVal;
+      tiers[idx].maxPts  = maxVal;
+      tiers[idx].lotSize = lotVal;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Parse all 4 tier input strings for a direction                     |
+//+------------------------------------------------------------------+
+void ParseAllTiers(string s1, string s2, string s3, string s4,
+                   LotTier &tiers[], int &count)
+{
+   count = 0;
+   ArrayResize(tiers, 0);
+
+   ParseTierString(s1, tiers, count);
+   ParseTierString(s2, tiers, count);
+   ParseTierString(s3, tiers, count);
+   ParseTierString(s4, tiers, count);
+}
+
+//+------------------------------------------------------------------+
+//| Look up lot size from tier array based on point distance           |
+//+------------------------------------------------------------------+
+double LookupLot(double points, const LotTier &tiers[], int count)
+{
+   for(int i = 0; i < count; i++)
+   {
+      if(points >= tiers[i].minPts && points < tiers[i].maxPts)
+         return tiers[i].lotSize;
+   }
+   return Default_Lot;
+}
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
@@ -97,6 +195,22 @@ int OnInit()
       return INIT_FAILED;
    }
 
+   //--- Parse lot size tiers
+   ParseAllTiers(Sell_Tiers_1, Sell_Tiers_2, Sell_Tiers_3, Sell_Tiers_4,
+                 g_sellTiers, g_sellTierCount);
+   ParseAllTiers(Buy_Tiers_1, Buy_Tiers_2, Buy_Tiers_3, Buy_Tiers_4,
+                 g_buyTiers, g_buyTierCount);
+
+   Print("Sell lot tiers loaded: ", g_sellTierCount);
+   for(int i = 0; i < g_sellTierCount; i++)
+      Print("  Sell Tier ", i+1, ": ", g_sellTiers[i].minPts, "-",
+            g_sellTiers[i].maxPts, " pts = ", g_sellTiers[i].lotSize, " lots");
+
+   Print("Buy lot tiers loaded: ", g_buyTierCount);
+   for(int i = 0; i < g_buyTierCount; i++)
+      Print("  Buy Tier ", i+1, ": ", g_buyTiers[i].minPts, "-",
+            g_buyTiers[i].maxPts, " pts = ", g_buyTiers[i].lotSize, " lots");
+
    //--- Configure trade object
    g_trade.SetExpertMagicNumber(Magic_Number);
    g_trade.SetDeviationInPoints(Max_Slippage);
@@ -112,8 +226,9 @@ int OnInit()
       else if(emaSlow[0] < emaFast[0]) g_prevEMARelation = -1;
    }
 
-   Print("EMA Crossover EA initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
-         " | TP x", DoubleToString(TP_Multiplier, 1), " | Magic: ", Magic_Number);
+   Print("EMA Crossover EA v1.1 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+         " | TP x", DoubleToString(TP_Multiplier, 1), " | Magic: ", Magic_Number,
+         " | Sell Tiers: ", g_sellTierCount, " | Buy Tiers: ", g_buyTierCount);
 
    return INIT_SUCCEEDED;
 }
@@ -255,7 +370,7 @@ void CheckSellEntry(double op, double hi, double lo, double cl, double ema33, bo
 
    //--- Get lot size from tiers (based on High-to-Close distance in points)
    double pointDist = highToClose / _Point;
-   double lot = GetSellLot(pointDist);
+   double lot = LookupLot(pointDist, g_sellTiers, g_sellTierCount);
    lot = NormalizeLot(lot);
 
    //--- Place sell order at market
@@ -320,7 +435,7 @@ void CheckBuyEntry(double op, double hi, double lo, double cl, double ema33, boo
 
    //--- Get lot size from tiers (based on Low-to-Close distance in points)
    double pointDist = closeToLow / _Point;
-   double lot = GetBuyLot(pointDist);
+   double lot = LookupLot(pointDist, g_buyTiers, g_buyTierCount);
    lot = NormalizeLot(lot);
 
    //--- Place buy order at market
@@ -363,32 +478,6 @@ bool IsLowestLow(double low, int barIndex)
          return false;
    }
    return true;
-}
-
-//+------------------------------------------------------------------+
-//| Get lot size from sell tiers based on point distance               |
-//+------------------------------------------------------------------+
-double GetSellLot(double points)
-{
-   if(points >= Sell_T1_MinPts && points < Sell_T1_MaxPts) return Sell_T1_Lot;
-   if(points >= Sell_T2_MinPts && points < Sell_T2_MaxPts) return Sell_T2_Lot;
-   if(points >= Sell_T3_MinPts && points < Sell_T3_MaxPts) return Sell_T3_Lot;
-   if(points >= Sell_T4_MinPts && points < Sell_T4_MaxPts) return Sell_T4_Lot;
-   if(points >= Sell_T5_MinPts && points < Sell_T5_MaxPts) return Sell_T5_Lot;
-   return Default_Lot;
-}
-
-//+------------------------------------------------------------------+
-//| Get lot size from buy tiers based on point distance                |
-//+------------------------------------------------------------------+
-double GetBuyLot(double points)
-{
-   if(points >= Buy_T1_MinPts && points < Buy_T1_MaxPts) return Buy_T1_Lot;
-   if(points >= Buy_T2_MinPts && points < Buy_T2_MaxPts) return Buy_T2_Lot;
-   if(points >= Buy_T3_MinPts && points < Buy_T3_MaxPts) return Buy_T3_Lot;
-   if(points >= Buy_T4_MinPts && points < Buy_T4_MaxPts) return Buy_T4_Lot;
-   if(points >= Buy_T5_MinPts && points < Buy_T5_MaxPts) return Buy_T5_Lot;
-   return Default_Lot;
 }
 
 //+------------------------------------------------------------------+
@@ -487,9 +576,8 @@ void CloseAllTrades()
 void UpdateChartComment(double emaFastVal, double emaSlowVal)
 {
    string signal = "None";
-   color  sigCol = clrGray;
-   if(g_crossDir == 1)  { signal = "SELL"; sigCol = clrRed; }
-   if(g_crossDir == -1) { signal = "BUY";  sigCol = clrGreen; }
+   if(g_crossDir == 1)  signal = "SELL";
+   if(g_crossDir == -1) signal = "BUY";
 
    string status = "";
    if(g_tradeTaken)
@@ -503,15 +591,17 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    if(IsCloseTime()) tradingStatus = "CLOSING";
 
    Comment(StringFormat(
-      "====== EMA Crossover EA ======\n"
+      "====== EMA Crossover EA v1.1 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
       "Signal: %s%s\n"
       "Trading: %s\n"
+      "Sell Tiers: %d  |  Buy Tiers: %d\n"
       "Open Positions: %s\n"
-      "==============================",
+      "===================================",
       EMA_Fast_Period, emaFastVal, EMA_Slow_Period, emaSlowVal,
       signal, status,
       tradingStatus,
+      g_sellTierCount, g_buyTierCount,
       HasOpenPosition() ? "Yes" : "No"
    ));
 }
