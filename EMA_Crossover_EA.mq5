@@ -3,11 +3,11 @@
 //|                                          Copyright 2026            |
 //|                  EMA 9/33 Crossover with Candle Structure Filter   |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v1.1"
-#property version   "1.10"
+#property copyright "EMA Crossover EA v1.2"
+#property version   "1.20"
 #property description "EMA 9/33 Crossover Strategy with Candle Structure Filter"
 #property description "Designed for Gold (XAUUSD) on M1 timeframe"
-#property description "Supports up to 40 lot size tiers for Buy and Sell"
+#property description "Hidden SL (manual close) + up to 40 lot tiers"
 
 #include <Trade\Trade.mqh>
 
@@ -81,6 +81,10 @@ LotTier  g_buyTiers[];
 int      g_sellTierCount  = 0;
 int      g_buyTierCount   = 0;
 
+//--- Manual SL tracking (hidden stop loss)
+double   g_manualSL       = 0;     // Price level to close trade at
+int      g_tradeDir       = 0;     // 1 = sell position, -1 = buy position
+
 //+------------------------------------------------------------------+
 //| Parse a single tier string into the tier array                     |
 //| Format: "minPts-maxPts:lotSize, minPts-maxPts:lotSize, ..."       |
@@ -91,7 +95,7 @@ bool ParseTierString(string tierStr, LotTier &tiers[], int &count)
    StringTrimRight(tierStr);
 
    if(StringLen(tierStr) == 0)
-      return true;  // Empty string is OK, skip
+      return true;
 
    string entries[];
    int numEntries = StringSplit(tierStr, ',', entries);
@@ -104,7 +108,6 @@ bool ParseTierString(string tierStr, LotTier &tiers[], int &count)
 
       if(StringLen(entry) == 0) continue;
 
-      //--- Find the '-' between min and max
       int dashPos = StringFind(entry, "-");
       if(dashPos <= 0)
       {
@@ -112,7 +115,6 @@ bool ParseTierString(string tierStr, LotTier &tiers[], int &count)
          continue;
       }
 
-      //--- Find the ':' between max and lot size
       int colonPos = StringFind(entry, ":");
       if(colonPos <= 0 || colonPos <= dashPos)
       {
@@ -120,7 +122,6 @@ bool ParseTierString(string tierStr, LotTier &tiers[], int &count)
          continue;
       }
 
-      //--- Extract the three values
       string minStr = StringSubstr(entry, 0, dashPos);
       string maxStr = StringSubstr(entry, dashPos + 1, colonPos - dashPos - 1);
       string lotStr = StringSubstr(entry, colonPos + 1);
@@ -139,7 +140,6 @@ bool ParseTierString(string tierStr, LotTier &tiers[], int &count)
          continue;
       }
 
-      //--- Add to array
       int idx = count;
       count++;
       ArrayResize(tiers, count);
@@ -185,7 +185,6 @@ double LookupLot(double points, const LotTier &tiers[], int count)
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   //--- Create EMA indicators
    g_handleEMAFast = iMA(_Symbol, PERIOD_CURRENT, EMA_Fast_Period, 0, MODE_EMA, PRICE_CLOSE);
    g_handleEMASlow = iMA(_Symbol, PERIOD_CURRENT, EMA_Slow_Period, 0, MODE_EMA, PRICE_CLOSE);
 
@@ -226,9 +225,13 @@ int OnInit()
       else if(emaSlow[0] < emaFast[0]) g_prevEMARelation = -1;
    }
 
-   Print("EMA Crossover EA v1.1 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+   //--- Reset manual SL tracking
+   g_manualSL  = 0;
+   g_tradeDir  = 0;
+
+   Print("EMA Crossover EA v1.2 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | TP x", DoubleToString(TP_Multiplier, 1), " | Magic: ", Magic_Number,
-         " | Sell Tiers: ", g_sellTierCount, " | Buy Tiers: ", g_buyTierCount);
+         " | Hidden SL | Sell Tiers: ", g_sellTierCount, " | Buy Tiers: ", g_buyTierCount);
 
    return INIT_SUCCEEDED;
 }
@@ -252,10 +255,22 @@ void OnTick()
    if(IsCloseTime())
    {
       CloseAllTrades();
+      g_manualSL = 0;
+      g_tradeDir = 0;
       return;
    }
 
-   //--- Only process logic on new bar
+   //--- MANUAL SL CHECK (every tick, hidden from broker)
+   CheckManualSL();
+
+   //--- If position was closed (by TP or manual SL), reset tracking
+   if(g_manualSL != 0 && !HasOpenPosition())
+   {
+      g_manualSL = 0;
+      g_tradeDir = 0;
+   }
+
+   //--- Only process entry logic on new bar
    datetime barTime = iTime(_Symbol, PERIOD_CURRENT, 0);
    if(barTime == g_lastBarTime) return;
    g_lastBarTime = barTime;
@@ -275,14 +290,14 @@ void OnTick()
    //--- Cross detected when relationship changes
    if(g_prevEMARelation != 0 && currRelation != 0 && g_prevEMARelation != currRelation)
    {
-      if(currRelation == 1)  // 33 EMA crossed ABOVE 9 EMA -> Sell signal
+      if(currRelation == 1)
       {
          g_crossDir       = 1;
          g_barsSinceCross = 0;
          g_tradeTaken     = false;
          Print(">>> SIGNAL: EMA", EMA_Slow_Period, " crossed ABOVE EMA", EMA_Fast_Period, " -> SELL");
       }
-      else if(currRelation == -1)  // 33 EMA crossed BELOW 9 EMA -> Buy signal
+      else if(currRelation == -1)
       {
          g_crossDir       = -1;
          g_barsSinceCross = 0;
@@ -302,11 +317,11 @@ void OnTick()
       g_barsSinceCross++;
 
    //--- Check if we should look for entry
-   if(g_crossDir == 0)                         return;  // No signal
-   if(g_barsSinceCross > Max_Candles)           return;  // Window expired
-   if(g_tradeTaken)                             return;  // Already traded this signal
-   if(!IsTradingTime())                         return;  // Outside trading hours
-   if(HasOpenPosition())                        return;  // Already have a position
+   if(g_crossDir == 0)                         return;
+   if(g_barsSinceCross > Max_Candles)           return;
+   if(g_tradeTaken)                             return;
+   if(!IsTradingTime())                         return;
+   if(HasOpenPosition())                        return;
 
    //--- Analyze the completed candle (bar 1)
    double op  = iOpen(_Symbol, PERIOD_CURRENT, 1);
@@ -317,7 +332,6 @@ void OnTick()
 
    bool isBear = (cl < op);
 
-   //--- Check entry conditions
    if(g_crossDir == 1)
       CheckSellEntry(op, hi, lo, cl, ema33, isBear);
    else if(g_crossDir == -1)
@@ -325,11 +339,47 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
+//| MANUAL SL: Check price on every tick and close if crossed          |
+//| No SL is placed on the order — broker cannot see the stop         |
+//+------------------------------------------------------------------+
+void CheckManualSL()
+{
+   if(g_manualSL == 0 || g_tradeDir == 0) return;
+   if(!HasOpenPosition()) return;
+
+   if(g_tradeDir == 1)  // SELL position: close if Ask crosses above candle high
+   {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      if(ask >= g_manualSL)
+      {
+         Print(StringFormat("MANUAL SL HIT (Sell): Ask=%.2f >= SL=%.2f -> Closing", ask, g_manualSL));
+         CloseAllTrades();
+         g_manualSL = 0;
+         g_tradeDir = 0;
+      }
+   }
+   else if(g_tradeDir == -1)  // BUY position: close if Bid crosses below candle low
+   {
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(bid <= g_manualSL)
+      {
+         Print(StringFormat("MANUAL SL HIT (Buy): Bid=%.2f <= SL=%.2f -> Closing", bid, g_manualSL));
+         CloseAllTrades();
+         g_manualSL = 0;
+         g_tradeDir = 0;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| SELL ENTRY: Check candle conditions and place sell trade           |
+//|                                                                    |
+//| Bearish candle: (H-O)>(C-O) and (H-O)>(C-L)                      |
+//| Bullish candle: (H-C)>(O-C) and (H-C)>(O-L)                      |
 //+------------------------------------------------------------------+
 void CheckSellEntry(double op, double hi, double lo, double cl, double ema33, bool isBear)
 {
-   //--- Candle High must be the highest of previous 7 candles
+   //--- Candle High must be the highest of previous N candles
    if(!IsHighestHigh(hi, 1))
       return;
 
@@ -340,48 +390,49 @@ void CheckSellEntry(double op, double hi, double lo, double cl, double ema33, bo
       //--- Bear candle: must NOT close below 33 EMA
       if(cl < ema33) return;
 
-      wickUpper = hi - op;     // High to Open (upper wick)
-      wickLower = cl - lo;     // Close to Low (lower wick)
-      body      = op - cl;     // Open to Close (body)
+      wickUpper = hi - op;     // (High - Open)
+      body      = op - cl;     // (Close - Open) = (Open - Close) absolute
+      wickLower = cl - lo;     // (Close - Low)
 
-      //--- Upper wick must be > lower wick AND > body
-      if(wickUpper <= wickLower || wickUpper <= body) return;
+      //--- (High-Open) > (Open-Close) AND (High-Open) > (Close-Low)
+      if(wickUpper <= body || wickUpper <= wickLower) return;
    }
    else
    {
       //--- Bull candle: must NOT open below 33 EMA
       if(op < ema33) return;
 
-      wickUpper = hi - cl;     // High to Close (upper wick)
-      body      = cl - op;     // Close to Open (body)
-      wickLower = op - lo;     // Open to Low (lower wick)
+      wickUpper = hi - cl;     // (High - Close)
+      body      = cl - op;     // (Open - Close) = (Close - Open) absolute
+      wickLower = op - lo;     // (Open - Low)
 
-      //--- Upper wick must be > body AND > lower wick
+      //--- (High-Close) > (Open-Close) AND (High-Close) > (Open-Low)
       if(wickUpper <= body || wickUpper <= wickLower) return;
    }
 
-   //--- Calculate SL and TP
+   //--- Calculate TP (no broker SL — we monitor manually)
    double highToClose = hi - cl;
 
-   if(highToClose <= 0) return;  // Safety check
+   if(highToClose <= 0) return;
 
-   double sl = NormalizeDouble(hi, _Digits);
    double tp = NormalizeDouble(cl - (TP_Multiplier * highToClose), _Digits);
 
-   //--- Get lot size from tiers (based on High-to-Close distance in points)
+   //--- Get lot size from tiers
    double pointDist = highToClose / _Point;
    double lot = LookupLot(pointDist, g_sellTiers, g_sellTierCount);
    lot = NormalizeLot(lot);
 
-   //--- Place sell order at market
+   //--- Place sell order (NO SL on order, TP only)
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-   if(g_trade.Sell(lot, _Symbol, price, sl, tp,
+   if(g_trade.Sell(lot, _Symbol, price, 0, tp,
       StringFormat("EMA%d/%d Sell | Wick:%.0fpts", EMA_Fast_Period, EMA_Slow_Period, pointDist)))
    {
       g_tradeTaken = true;
-      Print(StringFormat("SELL OPENED: Price=%.2f Lot=%.2f SL=%.2f TP=%.2f H2C=%.0fpts",
-            price, lot, sl, tp, pointDist));
+      g_manualSL   = NormalizeDouble(hi, _Digits);  // Hidden SL at candle High
+      g_tradeDir   = 1;
+      Print(StringFormat("SELL OPENED: Price=%.2f Lot=%.2f HiddenSL=%.2f TP=%.2f H2C=%.0fpts",
+            price, lot, g_manualSL, tp, pointDist));
    }
    else
    {
@@ -391,10 +442,13 @@ void CheckSellEntry(double op, double hi, double lo, double cl, double ema33, bo
 
 //+------------------------------------------------------------------+
 //| BUY ENTRY: Check candle conditions and place buy trade            |
+//|                                                                    |
+//| Bullish candle: (O-L)>(O-C) and (O-L)>(C-H)                      |
+//| Bearish candle: (C-L)>(C-O) and (C-L)>(H-O)                      |
 //+------------------------------------------------------------------+
 void CheckBuyEntry(double op, double hi, double lo, double cl, double ema33, bool isBear)
 {
-   //--- Candle Low must be the lowest of previous 7 candles
+   //--- Candle Low must be the lowest of previous N candles
    if(!IsLowestLow(lo, 1))
       return;
 
@@ -405,11 +459,11 @@ void CheckBuyEntry(double op, double hi, double lo, double cl, double ema33, boo
       //--- Bear candle: must NOT open above 33 EMA
       if(op > ema33) return;
 
-      wickLower = cl - lo;     // Close to Low (lower wick for bear)
-      body      = op - cl;     // Open to Close (body)
-      wickUpper = hi - op;     // High to Open (upper wick for bear)
+      wickLower = cl - lo;     // (Low - Close) = (Close - Low) absolute
+      body      = op - cl;     // (Close - Open) = (Open - Close) absolute
+      wickUpper = hi - op;     // (High - Open)
 
-      //--- Lower wick must be > body AND > upper wick
+      //--- (Close-Low) > (Open-Close) AND (Close-Low) > (High-Open)
       if(wickLower <= body || wickLower <= wickUpper) return;
    }
    else
@@ -417,36 +471,37 @@ void CheckBuyEntry(double op, double hi, double lo, double cl, double ema33, boo
       //--- Bull candle: must NOT close above 33 EMA
       if(cl > ema33) return;
 
-      wickLower = op - lo;     // Open to Low (lower wick for bull)
-      body      = cl - op;     // Close to Open (body)
-      wickUpper = hi - cl;     // High to Close (upper wick for bull)
+      wickLower = op - lo;     // (Low - Open) = (Open - Low) absolute
+      body      = cl - op;     // (Open - Close) = (Close - Open) absolute
+      wickUpper = hi - cl;     // (Close - High) = (High - Close) absolute
 
-      //--- Lower wick must be > body AND > upper wick
+      //--- (Open-Low) > (Close-Open) AND (Open-Low) > (High-Close)
       if(wickLower <= body || wickLower <= wickUpper) return;
    }
 
-   //--- Calculate SL and TP
+   //--- Calculate TP (no broker SL — we monitor manually)
    double closeToLow = cl - lo;
 
-   if(closeToLow <= 0) return;  // Safety check
+   if(closeToLow <= 0) return;
 
-   double sl = NormalizeDouble(lo, _Digits);
    double tp = NormalizeDouble(cl + (TP_Multiplier * closeToLow), _Digits);
 
-   //--- Get lot size from tiers (based on Low-to-Close distance in points)
+   //--- Get lot size from tiers
    double pointDist = closeToLow / _Point;
    double lot = LookupLot(pointDist, g_buyTiers, g_buyTierCount);
    lot = NormalizeLot(lot);
 
-   //--- Place buy order at market
+   //--- Place buy order (NO SL on order, TP only)
    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
-   if(g_trade.Buy(lot, _Symbol, price, sl, tp,
+   if(g_trade.Buy(lot, _Symbol, price, 0, tp,
       StringFormat("EMA%d/%d Buy | Wick:%.0fpts", EMA_Fast_Period, EMA_Slow_Period, pointDist)))
    {
       g_tradeTaken = true;
-      Print(StringFormat("BUY OPENED: Price=%.2f Lot=%.2f SL=%.2f TP=%.2f L2C=%.0fpts",
-            price, lot, sl, tp, pointDist));
+      g_manualSL   = NormalizeDouble(lo, _Digits);  // Hidden SL at candle Low
+      g_tradeDir   = -1;
+      Print(StringFormat("BUY OPENED: Price=%.2f Lot=%.2f HiddenSL=%.2f TP=%.2f L2C=%.0fpts",
+            price, lot, g_manualSL, tp, pointDist));
    }
    else
    {
@@ -562,7 +617,7 @@ void CloseAllTrades()
             PositionGetInteger(POSITION_MAGIC) == Magic_Number)
          {
             if(g_trade.PositionClose(ticket))
-               Print("Position ", ticket, " closed (market close time)");
+               Print("Position ", ticket, " closed");
             else
                Print("Failed to close position ", ticket);
          }
@@ -590,19 +645,24 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    string tradingStatus = IsTradingTime() ? "ACTIVE" : "PAUSED";
    if(IsCloseTime()) tradingStatus = "CLOSING";
 
+   string slInfo = "";
+   if(g_manualSL != 0)
+      slInfo = StringFormat("\nHidden SL: %.2f (%s)", g_manualSL, g_tradeDir == 1 ? "Sell" : "Buy");
+
    Comment(StringFormat(
-      "====== EMA Crossover EA v1.1 ======\n"
+      "====== EMA Crossover EA v1.2 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
       "Signal: %s%s\n"
       "Trading: %s\n"
       "Sell Tiers: %d  |  Buy Tiers: %d\n"
-      "Open Positions: %s\n"
+      "Open Positions: %s%s\n"
       "===================================",
       EMA_Fast_Period, emaFastVal, EMA_Slow_Period, emaSlowVal,
       signal, status,
       tradingStatus,
       g_sellTierCount, g_buyTierCount,
-      HasOpenPosition() ? "Yes" : "No"
+      HasOpenPosition() ? "Yes" : "No",
+      slInfo
    ));
 }
 //+------------------------------------------------------------------+
