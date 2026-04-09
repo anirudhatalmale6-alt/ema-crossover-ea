@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                          EMA_Crossover_EA.mq5     |
 //|                                          Copyright 2026            |
-//|                  EMA 9/33 Crossover + Hammer/Shooting Star + RSI   |
+//|                  EMA 9/33 Crossover + Hammer/Shooting Star         |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v1.4"
-#property version   "1.40"
-#property description "EMA 9/33 Crossover + Hammer Pattern + RSI(2) Filter"
+#property copyright "EMA Crossover EA v1.5"
+#property version   "1.50"
+#property description "EMA 9/33 Crossover + Hammer Pattern (No RSI)"
 #property description "Designed for Gold (XAUUSD) on M1 timeframe"
 #property description "Hidden SL (manual close) + up to 40 lot tiers"
 
@@ -21,11 +21,6 @@ input int      EMA_Slow_Period   = 33;         // Slow EMA Period
 input int      Max_Candles       = 15;         // Max candles after cross for entry
 input int      HighLow_Lookback  = 7;          // Lookback bars for highest/lowest check
 input double   TP_Multiplier     = 5.0;        // Take Profit multiplier (x wick distance)
-
-input group "══════ RSI Filter ══════"
-input int      RSI_Period        = 2;          // RSI Period
-input double   RSI_Oversold      = 5.0;        // RSI Oversold level (Buy when RSI below this)
-input double   RSI_Overbought    = 95.0;       // RSI Overbought level (Sell when RSI above this)
 
 input group "══════ Hammer Pattern Settings ══════"
 input double   Hammer_WickRatio  = 2.0;        // Min wick-to-body ratio (2.0 = wick must be 2x body)
@@ -77,7 +72,6 @@ struct LotTier
 
 int    g_handleEMAFast;
 int    g_handleEMASlow;
-int    g_handleRSI;
 CTrade g_trade;
 
 datetime g_lastBarTime    = 0;
@@ -196,11 +190,10 @@ int OnInit()
 {
    g_handleEMAFast = iMA(_Symbol, PERIOD_CURRENT, EMA_Fast_Period, 0, MODE_EMA, PRICE_CLOSE);
    g_handleEMASlow = iMA(_Symbol, PERIOD_CURRENT, EMA_Slow_Period, 0, MODE_EMA, PRICE_CLOSE);
-   g_handleRSI     = iRSI(_Symbol, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
 
-   if(g_handleEMAFast == INVALID_HANDLE || g_handleEMASlow == INVALID_HANDLE || g_handleRSI == INVALID_HANDLE)
+   if(g_handleEMAFast == INVALID_HANDLE || g_handleEMASlow == INVALID_HANDLE)
    {
-      Print("ERROR: Failed to create EMA/RSI indicators");
+      Print("ERROR: Failed to create EMA indicators");
       return INIT_FAILED;
    }
 
@@ -239,8 +232,7 @@ int OnInit()
    g_manualSL  = 0;
    g_tradeDir  = 0;
 
-   Print("EMA Crossover EA v1.4 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
-         " | RSI(", RSI_Period, ") OB:", DoubleToString(RSI_Overbought, 1), " OS:", DoubleToString(RSI_Oversold, 1),
+   Print("EMA Crossover EA v1.5 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | Hammer Wick Ratio: ", DoubleToString(Hammer_WickRatio, 1),
          " | TP x", DoubleToString(TP_Multiplier, 1), " | Magic: ", Magic_Number,
          " | Hidden SL | Sell Tiers: ", g_sellTierCount, " | Buy Tiers: ", g_buyTierCount);
@@ -255,7 +247,6 @@ void OnDeinit(const int reason)
 {
    if(g_handleEMAFast != INVALID_HANDLE) IndicatorRelease(g_handleEMAFast);
    if(g_handleEMASlow != INVALID_HANDLE) IndicatorRelease(g_handleEMASlow);
-   if(g_handleRSI     != INVALID_HANDLE) IndicatorRelease(g_handleRSI);
    Comment("");
 }
 
@@ -335,24 +326,6 @@ void OnTick()
    if(g_tradeTaken)                             return;
    if(!IsTradingTime())                         return;
    if(HasOpenPosition())                        return;
-
-   //--- RSI(2) filter: check entry candle (bar 1) or 1 candle before (bar 2)
-   double rsiVals[3];
-   if(CopyBuffer(g_handleRSI, 0, 0, 3, rsiVals) < 3) return;
-   ArraySetAsSeries(rsiVals, true);
-
-   //--- For SELL: RSI(2) must be > RSI_Overbought on bar 1 or bar 2
-   //--- For BUY:  RSI(2) must be < RSI_Oversold on bar 1 or bar 2
-   if(g_crossDir == 1)
-   {
-      if(rsiVals[1] <= RSI_Overbought && rsiVals[2] <= RSI_Overbought)
-         return;
-   }
-   else if(g_crossDir == -1)
-   {
-      if(rsiVals[1] >= RSI_Oversold && rsiVals[2] >= RSI_Oversold)
-         return;
-   }
 
    //--- Analyze the completed candle (bar 1)
    double op  = iOpen(_Symbol, PERIOD_CURRENT, 1);
@@ -456,7 +429,7 @@ bool IsHammer(double op, double hi, double lo, double cl)
 }
 
 //+------------------------------------------------------------------+
-//| SELL ENTRY: Shooting Star + RSI > 95 + EMA cross                  |
+//| SELL ENTRY: Shooting Star + EMA cross                              |
 //+------------------------------------------------------------------+
 void CheckSellEntry(double op, double hi, double lo, double cl, double ema33)
 {
@@ -504,7 +477,7 @@ void CheckSellEntry(double op, double hi, double lo, double cl, double ema33)
 }
 
 //+------------------------------------------------------------------+
-//| BUY ENTRY: Hammer + RSI < 5 + EMA cross                          |
+//| BUY ENTRY: Hammer + EMA cross                                     |
 //+------------------------------------------------------------------+
 void CheckBuyEntry(double op, double hi, double lo, double cl, double ema33)
 {
@@ -689,16 +662,9 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    if(g_manualSL != 0)
       slInfo = StringFormat("\nHidden SL: %.2f (%s)", g_manualSL, g_tradeDir == 1 ? "Sell" : "Buy");
 
-   //--- Get current RSI value for display
-   double rsiCurr[1];
-   double rsiDisplay = 0;
-   if(CopyBuffer(g_handleRSI, 0, 1, 1, rsiCurr) >= 1)
-      rsiDisplay = rsiCurr[0];
-
    Comment(StringFormat(
-      "====== EMA Crossover EA v1.4 ======\n"
+      "====== EMA Crossover EA v1.5 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
-      "RSI(%d): %.1f  |  OB: %.0f  OS: %.0f\n"
       "Hammer Wick Ratio: %.1f  |  Max Short: %.0f%%\n"
       "Signal: %s%s\n"
       "Trading: %s\n"
@@ -706,7 +672,6 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
       "Open Positions: %s%s\n"
       "===================================",
       EMA_Fast_Period, emaFastVal, EMA_Slow_Period, emaSlowVal,
-      RSI_Period, rsiDisplay, RSI_Overbought, RSI_Oversold,
       Hammer_WickRatio, Hammer_MaxShort * 100,
       signal, status,
       tradingStatus,
