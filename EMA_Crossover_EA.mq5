@@ -1,13 +1,13 @@
 //+------------------------------------------------------------------+
 //|                                          EMA_Crossover_EA.mq5     |
 //|                                          Copyright 2026            |
-//|                  EMA 9/33 Crossover + Hammer/Shooting Star         |
+//|                  EMA 9/33 Crossover + Wick Dominance Filter        |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v1.6"
-#property version   "1.60"
+#property copyright "EMA Crossover EA v1.7"
+#property version   "1.70"
 #property description "EMA 9/33 Crossover + Wick Dominance Filter"
 #property description "Designed for Gold (XAUUSD) on M1 timeframe"
-#property description "Hidden SL (manual close) + up to 40 lot tiers"
+#property description "Hidden SL (manual close) + Risk-based lot sizing"
 
 #include <Trade\Trade.mqh>
 
@@ -31,36 +31,9 @@ input int      Open_Delay_Min    = 60;         // Minutes after open to start tr
 input int      Close_Before_Min  = 10;         // Minutes before close to exit all trades
 
 input group "══════ Trade Settings ══════"
-input double   Default_Lot       = 0.01;       // Default Lot Size (if no tier matches)
+input double   Risk_Amount       = 10.0;       // Risk Amount per trade (USD)
 input int      Magic_Number      = 202601;     // Magic Number
 input int      Max_Slippage      = 30;         // Maximum Slippage (points)
-
-//--- Sell Lot Tiers: Format per entry is  minPts-maxPts:lotSize
-//--- Example: 0-100:0.01, 100-200:0.02, 200-300:0.05
-//--- Split across 4 boxes (up to 10 tiers each = 40 total)
-
-input group "══════ Sell Lot Tiers (High-to-Close pts) ══════"
-input string   Sell_Tiers_1  = "0-50:0.01, 50-100:0.02, 100-150:0.03, 150-200:0.04, 200-250:0.05, 250-300:0.06, 300-350:0.07, 350-400:0.08, 400-450:0.09, 450-500:0.10";  // Sell Tiers 1-10
-input string   Sell_Tiers_2  = "";  // Sell Tiers 11-20
-input string   Sell_Tiers_3  = "";  // Sell Tiers 21-30
-input string   Sell_Tiers_4  = "";  // Sell Tiers 31-40
-
-input group "══════ Buy Lot Tiers (Low-to-Close pts) ══════"
-input string   Buy_Tiers_1   = "0-50:0.01, 50-100:0.02, 100-150:0.03, 150-200:0.04, 200-250:0.05, 250-300:0.06, 300-350:0.07, 350-400:0.08, 400-450:0.09, 450-500:0.10";  // Buy Tiers 1-10
-input string   Buy_Tiers_2   = "";  // Buy Tiers 11-20
-input string   Buy_Tiers_3   = "";  // Buy Tiers 21-30
-input string   Buy_Tiers_4   = "";  // Buy Tiers 31-40
-
-//+------------------------------------------------------------------+
-//| Lot Tier Structure                                                 |
-//+------------------------------------------------------------------+
-
-struct LotTier
-{
-   double minPts;
-   double maxPts;
-   double lotSize;
-};
 
 //+------------------------------------------------------------------+
 //| Global Variables                                                   |
@@ -76,107 +49,34 @@ int      g_barsSinceCross = 0;
 bool     g_tradeTaken     = false;
 int      g_prevEMARelation= 0;     // 1 = slow > fast, -1 = slow < fast
 
-LotTier  g_sellTiers[];
-LotTier  g_buyTiers[];
-int      g_sellTierCount  = 0;
-int      g_buyTierCount   = 0;
-
 //--- Manual SL tracking (hidden stop loss)
 double   g_manualSL       = 0;     // Price level to close trade at
 int      g_tradeDir       = 0;     // 1 = sell position, -1 = buy position
 
 //+------------------------------------------------------------------+
-//| Parse a single tier string into the tier array                     |
+//| Calculate lot size based on risk amount and SL distance            |
+//| lot = RiskAmount / (slDistance / tickSize * tickValue)              |
 //+------------------------------------------------------------------+
-bool ParseTierString(string tierStr, LotTier &tiers[], int &count)
+double CalcLotFromRisk(double slDistancePrice)
 {
-   StringTrimLeft(tierStr);
-   StringTrimRight(tierStr);
+   if(slDistancePrice <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
 
-   if(StringLen(tierStr) == 0)
-      return true;
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
 
-   string entries[];
-   int numEntries = StringSplit(tierStr, ',', entries);
-
-   for(int i = 0; i < numEntries; i++)
+   if(tickSize <= 0 || tickValue <= 0)
    {
-      string entry = entries[i];
-      StringTrimLeft(entry);
-      StringTrimRight(entry);
-
-      if(StringLen(entry) == 0) continue;
-
-      int dashPos = StringFind(entry, "-");
-      if(dashPos <= 0)
-      {
-         Print("WARNING: Invalid tier format (no dash): ", entry);
-         continue;
-      }
-
-      int colonPos = StringFind(entry, ":");
-      if(colonPos <= 0 || colonPos <= dashPos)
-      {
-         Print("WARNING: Invalid tier format (no colon): ", entry);
-         continue;
-      }
-
-      string minStr = StringSubstr(entry, 0, dashPos);
-      string maxStr = StringSubstr(entry, dashPos + 1, colonPos - dashPos - 1);
-      string lotStr = StringSubstr(entry, colonPos + 1);
-
-      StringTrimLeft(minStr);  StringTrimRight(minStr);
-      StringTrimLeft(maxStr);  StringTrimRight(maxStr);
-      StringTrimLeft(lotStr);  StringTrimRight(lotStr);
-
-      double minVal = StringToDouble(minStr);
-      double maxVal = StringToDouble(maxStr);
-      double lotVal = StringToDouble(lotStr);
-
-      if(maxVal <= minVal || lotVal <= 0)
-      {
-         Print("WARNING: Invalid tier values: min=", minVal, " max=", maxVal, " lot=", lotVal);
-         continue;
-      }
-
-      int idx = count;
-      count++;
-      ArrayResize(tiers, count);
-
-      tiers[idx].minPts  = minVal;
-      tiers[idx].maxPts  = maxVal;
-      tiers[idx].lotSize = lotVal;
+      Print("WARNING: Cannot get tick size/value. Using min lot.");
+      return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    }
 
-   return true;
-}
+   double lossPerLot = (slDistancePrice / tickSize) * tickValue;
+   double lot = Risk_Amount / lossPerLot;
 
-//+------------------------------------------------------------------+
-//| Parse all 4 tier input strings for a direction                     |
-//+------------------------------------------------------------------+
-void ParseAllTiers(string s1, string s2, string s3, string s4,
-                   LotTier &tiers[], int &count)
-{
-   count = 0;
-   ArrayResize(tiers, 0);
+   Print(StringFormat("LOT CALC: Risk=$%.2f SLdist=%.5f TickSz=%.5f TickVal=%.2f LossPerLot=%.2f -> Lot=%.2f",
+         Risk_Amount, slDistancePrice, tickSize, tickValue, lossPerLot, lot));
 
-   ParseTierString(s1, tiers, count);
-   ParseTierString(s2, tiers, count);
-   ParseTierString(s3, tiers, count);
-   ParseTierString(s4, tiers, count);
-}
-
-//+------------------------------------------------------------------+
-//| Look up lot size from tier array based on point distance           |
-//+------------------------------------------------------------------+
-double LookupLot(double points, const LotTier &tiers[], int count)
-{
-   for(int i = 0; i < count; i++)
-   {
-      if(points >= tiers[i].minPts && points < tiers[i].maxPts)
-         return tiers[i].lotSize;
-   }
-   return Default_Lot;
+   return NormalizeLot(lot);
 }
 
 //+------------------------------------------------------------------+
@@ -192,22 +92,6 @@ int OnInit()
       Print("ERROR: Failed to create EMA indicators");
       return INIT_FAILED;
    }
-
-   //--- Parse lot size tiers
-   ParseAllTiers(Sell_Tiers_1, Sell_Tiers_2, Sell_Tiers_3, Sell_Tiers_4,
-                 g_sellTiers, g_sellTierCount);
-   ParseAllTiers(Buy_Tiers_1, Buy_Tiers_2, Buy_Tiers_3, Buy_Tiers_4,
-                 g_buyTiers, g_buyTierCount);
-
-   Print("Sell lot tiers loaded: ", g_sellTierCount);
-   for(int i = 0; i < g_sellTierCount; i++)
-      Print("  Sell Tier ", i+1, ": ", g_sellTiers[i].minPts, "-",
-            g_sellTiers[i].maxPts, " pts = ", g_sellTiers[i].lotSize, " lots");
-
-   Print("Buy lot tiers loaded: ", g_buyTierCount);
-   for(int i = 0; i < g_buyTierCount; i++)
-      Print("  Buy Tier ", i+1, ": ", g_buyTiers[i].minPts, "-",
-            g_buyTiers[i].maxPts, " pts = ", g_buyTiers[i].lotSize, " lots");
 
    //--- Configure trade object
    g_trade.SetExpertMagicNumber(Magic_Number);
@@ -228,9 +112,10 @@ int OnInit()
    g_manualSL  = 0;
    g_tradeDir  = 0;
 
-   Print("EMA Crossover EA v1.6 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+   Print("EMA Crossover EA v1.7 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+         " | Risk: $", DoubleToString(Risk_Amount, 2),
          " | TP x", DoubleToString(TP_Multiplier, 1), " | Magic: ", Magic_Number,
-         " | Hidden SL | Sell Tiers: ", g_sellTierCount, " | Buy Tiers: ", g_buyTierCount);
+         " | Hidden SL");
 
    return INIT_SUCCEEDED;
 }
@@ -408,27 +293,27 @@ void CheckSellEntry(double op, double hi, double lo, double cl, double ema33)
 
    if(upperWick <= 0) return;
 
+   //--- SL distance = High - Close (for lot calculation)
+   double slDistance = hi - cl;
+   if(slDistance <= 0) slDistance = hi - op;
+
    //--- TP = 5x the upper wick distance from entry
    double tp = NormalizeDouble(cl - (TP_Multiplier * upperWick), _Digits);
 
-   //--- Get lot size from tiers (based on high-to-close in points)
-   double highToClose = hi - cl;
-   if(highToClose <= 0) highToClose = hi - op;
-   double pointDist = highToClose / _Point;
-   double lot = LookupLot(pointDist, g_sellTiers, g_sellTierCount);
-   lot = NormalizeLot(lot);
+   //--- Calculate lot from risk amount and SL distance
+   double lot = CalcLotFromRisk(slDistance);
 
    //--- Place sell order (NO SL on order, TP only)
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    if(g_trade.Sell(lot, _Symbol, price, 0, tp,
-      StringFormat("EMA%d/%d Sell | Wick:%.0fpts", EMA_Fast_Period, EMA_Slow_Period, pointDist)))
+      StringFormat("EMA%d/%d Sell | Risk:$%.0f", EMA_Fast_Period, EMA_Slow_Period, Risk_Amount)))
    {
       g_tradeTaken = true;
       g_manualSL   = NormalizeDouble(hi, _Digits);  // Hidden SL at candle High
       g_tradeDir   = 1;
-      Print(StringFormat("SELL OPENED: Price=%.2f Lot=%.2f HiddenSL=%.2f TP=%.2f Wick=%.0fpts",
-            price, lot, g_manualSL, tp, pointDist));
+      Print(StringFormat("SELL OPENED: Price=%.2f Lot=%.2f HiddenSL=%.2f TP=%.2f SLdist=%.2f Risk=$%.2f",
+            price, lot, g_manualSL, tp, slDistance, Risk_Amount));
    }
    else
    {
@@ -458,7 +343,7 @@ void CheckBuyEntry(double op, double hi, double lo, double cl, double ema33)
 
    if(isBear)
    {
-      lowerWick = cl - lo;     // (C - L)  note: for bear C < O but C > L
+      lowerWick = cl - lo;     // (C - L)
       body      = op - cl;     // (O - C)
       upperWick = hi - op;     // (H - O)
 
@@ -477,27 +362,27 @@ void CheckBuyEntry(double op, double hi, double lo, double cl, double ema33)
 
    if(lowerWick <= 0) return;
 
+   //--- SL distance = Close - Low (for lot calculation)
+   double slDistance = cl - lo;
+   if(slDistance <= 0) slDistance = op - lo;
+
    //--- TP = 5x the lower wick distance from entry
    double tp = NormalizeDouble(cl + (TP_Multiplier * lowerWick), _Digits);
 
-   //--- Get lot size from tiers (based on low-to-close in points)
-   double lowToClose = cl - lo;
-   if(lowToClose <= 0) lowToClose = op - lo;
-   double pointDist = lowToClose / _Point;
-   double lot = LookupLot(pointDist, g_buyTiers, g_buyTierCount);
-   lot = NormalizeLot(lot);
+   //--- Calculate lot from risk amount and SL distance
+   double lot = CalcLotFromRisk(slDistance);
 
    //--- Place buy order (NO SL on order, TP only)
    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
    if(g_trade.Buy(lot, _Symbol, price, 0, tp,
-      StringFormat("EMA%d/%d Buy | Wick:%.0fpts", EMA_Fast_Period, EMA_Slow_Period, pointDist)))
+      StringFormat("EMA%d/%d Buy | Risk:$%.0f", EMA_Fast_Period, EMA_Slow_Period, Risk_Amount)))
    {
       g_tradeTaken = true;
       g_manualSL   = NormalizeDouble(lo, _Digits);  // Hidden SL at candle Low
       g_tradeDir   = -1;
-      Print(StringFormat("BUY OPENED: Price=%.2f Lot=%.2f HiddenSL=%.2f TP=%.2f Wick=%.0fpts",
-            price, lot, g_manualSL, tp, pointDist));
+      Print(StringFormat("BUY OPENED: Price=%.2f Lot=%.2f HiddenSL=%.2f TP=%.2f SLdist=%.2f Risk=$%.2f",
+            price, lot, g_manualSL, tp, slDistance, Risk_Amount));
    }
    else
    {
@@ -646,17 +531,17 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
       slInfo = StringFormat("\nHidden SL: %.2f (%s)", g_manualSL, g_tradeDir == 1 ? "Sell" : "Buy");
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v1.6 ======\n"
+      "====== EMA Crossover EA v1.7 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
+      "Risk per trade: $%.2f\n"
       "Signal: %s%s\n"
       "Trading: %s\n"
-      "Sell Tiers: %d  |  Buy Tiers: %d\n"
       "Open Positions: %s%s\n"
       "===================================",
       EMA_Fast_Period, emaFastVal, EMA_Slow_Period, emaSlowVal,
+      Risk_Amount,
       signal, status,
       tradingStatus,
-      g_sellTierCount, g_buyTierCount,
       HasOpenPosition() ? "Yes" : "No",
       slInfo
    ));
