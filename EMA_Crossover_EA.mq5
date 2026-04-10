@@ -3,9 +3,9 @@
 //|                                          Copyright 2026            |
 //|                  EMA 9/33 Crossover + Hammer/Shooting Star         |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v1.5"
-#property version   "1.50"
-#property description "EMA 9/33 Crossover + Hammer Pattern (No RSI)"
+#property copyright "EMA Crossover EA v1.6"
+#property version   "1.60"
+#property description "EMA 9/33 Crossover + Wick Dominance Filter"
 #property description "Designed for Gold (XAUUSD) on M1 timeframe"
 #property description "Hidden SL (manual close) + up to 40 lot tiers"
 
@@ -21,10 +21,6 @@ input int      EMA_Slow_Period   = 33;         // Slow EMA Period
 input int      Max_Candles       = 15;         // Max candles after cross for entry
 input int      HighLow_Lookback  = 7;          // Lookback bars for highest/lowest check
 input double   TP_Multiplier     = 5.0;        // Take Profit multiplier (x wick distance)
-
-input group "══════ Hammer Pattern Settings ══════"
-input double   Hammer_WickRatio  = 2.0;        // Min wick-to-body ratio (2.0 = wick must be 2x body)
-input double   Hammer_MaxShort   = 0.3;        // Max short wick as fraction of total range (0.3 = 30%)
 
 input group "══════ Time Filter (Server Time) ══════"
 input int      Market_Open_Hour  = 1;          // Daily Market Open Hour
@@ -232,8 +228,7 @@ int OnInit()
    g_manualSL  = 0;
    g_tradeDir  = 0;
 
-   Print("EMA Crossover EA v1.5 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
-         " | Hammer Wick Ratio: ", DoubleToString(Hammer_WickRatio, 1),
+   Print("EMA Crossover EA v1.6 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | TP x", DoubleToString(TP_Multiplier, 1), " | Magic: ", Magic_Number,
          " | Hidden SL | Sell Tiers: ", g_sellTierCount, " | Buy Tiers: ", g_buyTierCount);
 
@@ -373,63 +368,11 @@ void CheckManualSL()
 }
 
 //+------------------------------------------------------------------+
-//| Detect SHOOTING STAR pattern (for sell trades)                     |
-//| Long upper wick, small body, small lower wick                      |
-//+------------------------------------------------------------------+
-bool IsShootingStar(double op, double hi, double lo, double cl)
-{
-   double range = hi - lo;
-   if(range <= 0) return false;
-
-   double body       = MathAbs(cl - op);
-   double upperWick  = hi - MathMax(op, cl);   // from body top to high
-   double lowerWick  = MathMin(op, cl) - lo;   // from body bottom to low
-
-   //--- Upper wick must be >= Hammer_WickRatio * body
-   if(body > 0 && upperWick < Hammer_WickRatio * body)
-      return false;
-
-   //--- If body is zero (doji), upper wick must be > 50% of range
-   if(body == 0 && upperWick < range * 0.5)
-      return false;
-
-   //--- Lower wick must be small (< Hammer_MaxShort of total range)
-   if(lowerWick > Hammer_MaxShort * range)
-      return false;
-
-   return true;
-}
-
-//+------------------------------------------------------------------+
-//| Detect HAMMER pattern (for buy trades)                             |
-//| Long lower wick, small body, small upper wick                      |
-//+------------------------------------------------------------------+
-bool IsHammer(double op, double hi, double lo, double cl)
-{
-   double range = hi - lo;
-   if(range <= 0) return false;
-
-   double body       = MathAbs(cl - op);
-   double upperWick  = hi - MathMax(op, cl);
-   double lowerWick  = MathMin(op, cl) - lo;
-
-   //--- Lower wick must be >= Hammer_WickRatio * body
-   if(body > 0 && lowerWick < Hammer_WickRatio * body)
-      return false;
-
-   //--- If body is zero (doji), lower wick must be > 50% of range
-   if(body == 0 && lowerWick < range * 0.5)
-      return false;
-
-   //--- Upper wick must be small (< Hammer_MaxShort of total range)
-   if(upperWick > Hammer_MaxShort * range)
-      return false;
-
-   return true;
-}
-
-//+------------------------------------------------------------------+
-//| SELL ENTRY: Shooting Star + EMA cross                              |
+//| SELL ENTRY: Wick dominance (upper wick > body AND lower wick)     |
+//| Candle must be above 33 EMA                                       |
+//|                                                                    |
+//| Bear candle: (H-O) > (O-C) AND (H-O) > (C-L)                    |
+//| Bull candle: (H-C) > (C-O) AND (H-C) > (O-L)                    |
 //+------------------------------------------------------------------+
 void CheckSellEntry(double op, double hi, double lo, double cl, double ema33)
 {
@@ -437,23 +380,40 @@ void CheckSellEntry(double op, double hi, double lo, double cl, double ema33)
    if(!IsHighestHigh(hi, 1))
       return;
 
-   //--- Candle must be above the 33 EMA (check both open and close)
+   //--- Candle must be above the 33 EMA
    if(MathMin(op, cl) < ema33)
       return;
 
-   //--- Must be a Shooting Star pattern
-   if(!IsShootingStar(op, hi, lo, cl))
-      return;
+   bool isBear = (cl < op);
+   double upperWick, body, lowerWick;
 
-   //--- Calculate wick distance and TP
+   if(isBear)
+   {
+      upperWick = hi - op;     // (H - O)
+      body      = op - cl;     // (O - C)
+      lowerWick = cl - lo;     // (C - L)
+
+      //--- (H-O) > (O-C) AND (H-O) > (C-L)
+      if(upperWick <= body || upperWick <= lowerWick) return;
+   }
+   else
+   {
+      upperWick = hi - cl;     // (H - C)
+      body      = cl - op;     // (C - O)
+      lowerWick = op - lo;     // (O - L)
+
+      //--- (H-C) > (C-O) AND (H-C) > (O-L)
+      if(upperWick <= body || upperWick <= lowerWick) return;
+   }
+
+   if(upperWick <= 0) return;
+
+   //--- TP = 5x the upper wick distance from entry
+   double tp = NormalizeDouble(cl - (TP_Multiplier * upperWick), _Digits);
+
+   //--- Get lot size from tiers (based on high-to-close in points)
    double highToClose = hi - cl;
-   if(highToClose <= 0) highToClose = hi - op;  // if bull candle, use hi - max(op,cl)
-   highToClose = hi - MathMax(op, cl);           // upper wick = distance from top of body to high
-   if(highToClose <= 0) return;
-
-   double tp = NormalizeDouble(MathMax(op, cl) - (TP_Multiplier * highToClose), _Digits);
-
-   //--- Get lot size from tiers (based on upper wick in points)
+   if(highToClose <= 0) highToClose = hi - op;
    double pointDist = highToClose / _Point;
    double lot = LookupLot(pointDist, g_sellTiers, g_sellTierCount);
    lot = NormalizeLot(lot);
@@ -462,7 +422,7 @@ void CheckSellEntry(double op, double hi, double lo, double cl, double ema33)
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    if(g_trade.Sell(lot, _Symbol, price, 0, tp,
-      StringFormat("EMA%d/%d ShootStar | Wick:%.0fpts", EMA_Fast_Period, EMA_Slow_Period, pointDist)))
+      StringFormat("EMA%d/%d Sell | Wick:%.0fpts", EMA_Fast_Period, EMA_Slow_Period, pointDist)))
    {
       g_tradeTaken = true;
       g_manualSL   = NormalizeDouble(hi, _Digits);  // Hidden SL at candle High
@@ -477,7 +437,11 @@ void CheckSellEntry(double op, double hi, double lo, double cl, double ema33)
 }
 
 //+------------------------------------------------------------------+
-//| BUY ENTRY: Hammer + EMA cross                                     |
+//| BUY ENTRY: Wick dominance (lower wick > body AND upper wick)     |
+//| Candle must be below 33 EMA                                       |
+//|                                                                    |
+//| Bear candle: (C-L) > (O-C) AND (C-L) > (H-O)                    |
+//| Bull candle: (O-L) > (C-O) AND (O-L) > (H-C)                    |
 //+------------------------------------------------------------------+
 void CheckBuyEntry(double op, double hi, double lo, double cl, double ema33)
 {
@@ -485,21 +449,40 @@ void CheckBuyEntry(double op, double hi, double lo, double cl, double ema33)
    if(!IsLowestLow(lo, 1))
       return;
 
-   //--- Candle must be below the 33 EMA (check both open and close)
+   //--- Candle must be below the 33 EMA
    if(MathMax(op, cl) > ema33)
       return;
 
-   //--- Must be a Hammer pattern
-   if(!IsHammer(op, hi, lo, cl))
-      return;
+   bool isBear = (cl < op);
+   double upperWick, body, lowerWick;
 
-   //--- Calculate wick distance and TP
-   double lowToClose = MathMin(op, cl) - lo;  // lower wick = distance from body bottom to low
-   if(lowToClose <= 0) return;
+   if(isBear)
+   {
+      lowerWick = cl - lo;     // (C - L)  note: for bear C < O but C > L
+      body      = op - cl;     // (O - C)
+      upperWick = hi - op;     // (H - O)
 
-   double tp = NormalizeDouble(MathMin(op, cl) + (TP_Multiplier * lowToClose), _Digits);
+      //--- (C-L) > (O-C) AND (C-L) > (H-O)
+      if(lowerWick <= body || lowerWick <= upperWick) return;
+   }
+   else
+   {
+      lowerWick = op - lo;     // (O - L)
+      body      = cl - op;     // (C - O)
+      upperWick = hi - cl;     // (H - C)
 
-   //--- Get lot size from tiers (based on lower wick in points)
+      //--- (O-L) > (C-O) AND (O-L) > (H-C)
+      if(lowerWick <= body || lowerWick <= upperWick) return;
+   }
+
+   if(lowerWick <= 0) return;
+
+   //--- TP = 5x the lower wick distance from entry
+   double tp = NormalizeDouble(cl + (TP_Multiplier * lowerWick), _Digits);
+
+   //--- Get lot size from tiers (based on low-to-close in points)
+   double lowToClose = cl - lo;
+   if(lowToClose <= 0) lowToClose = op - lo;
    double pointDist = lowToClose / _Point;
    double lot = LookupLot(pointDist, g_buyTiers, g_buyTierCount);
    lot = NormalizeLot(lot);
@@ -508,7 +491,7 @@ void CheckBuyEntry(double op, double hi, double lo, double cl, double ema33)
    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
    if(g_trade.Buy(lot, _Symbol, price, 0, tp,
-      StringFormat("EMA%d/%d Hammer | Wick:%.0fpts", EMA_Fast_Period, EMA_Slow_Period, pointDist)))
+      StringFormat("EMA%d/%d Buy | Wick:%.0fpts", EMA_Fast_Period, EMA_Slow_Period, pointDist)))
    {
       g_tradeTaken = true;
       g_manualSL   = NormalizeDouble(lo, _Digits);  // Hidden SL at candle Low
@@ -663,16 +646,14 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
       slInfo = StringFormat("\nHidden SL: %.2f (%s)", g_manualSL, g_tradeDir == 1 ? "Sell" : "Buy");
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v1.5 ======\n"
+      "====== EMA Crossover EA v1.6 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
-      "Hammer Wick Ratio: %.1f  |  Max Short: %.0f%%\n"
       "Signal: %s%s\n"
       "Trading: %s\n"
       "Sell Tiers: %d  |  Buy Tiers: %d\n"
       "Open Positions: %s%s\n"
       "===================================",
       EMA_Fast_Period, emaFastVal, EMA_Slow_Period, emaSlowVal,
-      Hammer_WickRatio, Hammer_MaxShort * 100,
       signal, status,
       tradingStatus,
       g_sellTierCount, g_buyTierCount,
