@@ -3,11 +3,11 @@
 //|                                          Copyright 2026            |
 //|                  EMA 9/33 Crossover + Wick Dominance Filter        |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v1.7"
-#property version   "1.70"
+#property copyright "EMA Crossover EA v1.8"
+#property version   "1.80"
 #property description "EMA 9/33 Crossover + Wick Dominance Filter"
 #property description "Designed for Gold (XAUUSD) on M1 timeframe"
-#property description "Hidden SL (manual close) + Risk-based lot sizing"
+#property description "Hidden SL + Risk-based lot + Multi-trade per signal"
 
 #include <Trade\Trade.mqh>
 
@@ -32,8 +32,19 @@ input int      Close_Before_Min  = 10;         // Minutes before close to exit a
 
 input group "══════ Trade Settings ══════"
 input double   Risk_Amount       = 10.0;       // Risk Amount per trade (USD)
+input double   SL_Buffer_Points  = 3.0;        // Points buffer above/below candle for SL close
 input int      Magic_Number      = 202601;     // Magic Number
 input int      Max_Slippage      = 30;         // Maximum Slippage (points)
+
+//+------------------------------------------------------------------+
+//| Trade tracking structure (for multiple positions)                   |
+//+------------------------------------------------------------------+
+struct TradeInfo
+{
+   ulong  ticket;
+   double slLevel;
+   int    direction;   // 1 = sell, -1 = buy
+};
 
 //+------------------------------------------------------------------+
 //| Global Variables                                                   |
@@ -46,35 +57,45 @@ CTrade g_trade;
 datetime g_lastBarTime    = 0;
 int      g_crossDir       = 0;     // 1 = sell signal, -1 = buy signal, 0 = none
 int      g_barsSinceCross = 0;
-bool     g_tradeTaken     = false;
 int      g_prevEMARelation= 0;     // 1 = slow > fast, -1 = slow < fast
 
-//--- Manual SL tracking (hidden stop loss)
-double   g_manualSL       = 0;     // Price level to close trade at
-int      g_tradeDir       = 0;     // 1 = sell position, -1 = buy position
+TradeInfo g_trades[];
+int       g_tradeCount = 0;
 
 //+------------------------------------------------------------------+
-//| Calculate lot size based on risk amount and SL distance            |
-//| lot = RiskAmount / (slDistance / tickSize * tickValue)              |
+//| Calculate lot size using OrderCalcProfit (broker-accurate)          |
 //+------------------------------------------------------------------+
-double CalcLotFromRisk(double slDistancePrice)
+double CalcLotFromRisk(double entryPrice, double slPrice, bool isSell)
 {
-   if(slDistancePrice <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double profit = 0;
+   ENUM_ORDER_TYPE orderType = isSell ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
 
-   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-
-   if(tickSize <= 0 || tickValue <= 0)
+   if(!OrderCalcProfit(orderType, _Symbol, 1.0, entryPrice, slPrice, profit))
    {
-      Print("WARNING: Cannot get tick size/value. Using min lot.");
+      Print("WARNING: OrderCalcProfit failed. Using fallback.");
+      double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+      double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      if(tickSize > 0 && tickValue > 0)
+      {
+         double slDist = MathAbs(entryPrice - slPrice);
+         double lossPerLot = (slDist / tickSize) * tickValue;
+         if(lossPerLot > 0)
+            return NormalizeLot(Risk_Amount / lossPerLot);
+      }
       return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    }
 
-   double lossPerLot = (slDistancePrice / tickSize) * tickValue;
+   double lossPerLot = MathAbs(profit);
+   if(lossPerLot <= 0)
+   {
+      Print("WARNING: Loss per lot = 0. Using min lot.");
+      return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   }
+
    double lot = Risk_Amount / lossPerLot;
 
-   Print(StringFormat("LOT CALC: Risk=$%.2f SLdist=%.5f TickSz=%.5f TickVal=%.2f LossPerLot=%.2f -> Lot=%.2f",
-         Risk_Amount, slDistancePrice, tickSize, tickValue, lossPerLot, lot));
+   Print(StringFormat("LOT CALC: Risk=$%.2f Entry=%.2f SL=%.2f LossPerLot=$%.2f -> Lot=%.4f",
+         Risk_Amount, entryPrice, slPrice, lossPerLot, lot));
 
    return NormalizeLot(lot);
 }
@@ -93,11 +114,9 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   //--- Configure trade object
    g_trade.SetExpertMagicNumber(Magic_Number);
    g_trade.SetDeviationInPoints(Max_Slippage);
 
-   //--- Initialize EMA relationship from history
    double emaFast[2], emaSlow[2];
    if(CopyBuffer(g_handleEMAFast, 0, 1, 2, emaFast) >= 2 &&
       CopyBuffer(g_handleEMASlow, 0, 1, 2, emaSlow) >= 2)
@@ -108,14 +127,14 @@ int OnInit()
       else if(emaSlow[0] < emaFast[0]) g_prevEMARelation = -1;
    }
 
-   //--- Reset manual SL tracking
-   g_manualSL  = 0;
-   g_tradeDir  = 0;
+   g_tradeCount = 0;
+   ArrayResize(g_trades, 0);
 
-   Print("EMA Crossover EA v1.7 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+   Print("EMA Crossover EA v1.8 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | Risk: $", DoubleToString(Risk_Amount, 2),
+         " | SL Buffer: ", DoubleToString(SL_Buffer_Points, 1), " pts",
          " | TP x", DoubleToString(TP_Multiplier, 1), " | Magic: ", Magic_Number,
-         " | Hidden SL");
+         " | Multi-trade per signal");
 
    return INIT_SUCCEEDED;
 }
@@ -135,57 +154,43 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   //--- Always check close time (runs every tick)
    if(IsCloseTime())
    {
       CloseAllTrades();
-      g_manualSL = 0;
-      g_tradeDir = 0;
+      g_tradeCount = 0;
+      ArrayResize(g_trades, 0);
       return;
    }
 
-   //--- MANUAL SL CHECK (every tick, hidden from broker)
    CheckManualSL();
+   CleanupClosedTrades();
 
-   //--- If position was closed (by TP or manual SL), reset tracking
-   if(g_manualSL != 0 && !HasOpenPosition())
-   {
-      g_manualSL = 0;
-      g_tradeDir = 0;
-   }
-
-   //--- Only process entry logic on new bar
    datetime barTime = iTime(_Symbol, PERIOD_CURRENT, 0);
    if(barTime == g_lastBarTime) return;
    g_lastBarTime = barTime;
 
-   //--- Get EMA values for bars 0, 1, 2
    double emaFast[3], emaSlow[3];
    if(CopyBuffer(g_handleEMAFast, 0, 0, 3, emaFast) < 3) return;
    if(CopyBuffer(g_handleEMASlow, 0, 0, 3, emaSlow) < 3) return;
    ArraySetAsSeries(emaFast, true);
    ArraySetAsSeries(emaSlow, true);
 
-   //--- Detect EMA crossover on completed bar (bar 1 vs bar 2)
    int currRelation = 0;
    if(emaSlow[1] > emaFast[1])      currRelation = 1;
    else if(emaSlow[1] < emaFast[1]) currRelation = -1;
 
-   //--- Cross detected when relationship changes
    if(g_prevEMARelation != 0 && currRelation != 0 && g_prevEMARelation != currRelation)
    {
       if(currRelation == 1)
       {
          g_crossDir       = 1;
          g_barsSinceCross = 0;
-         g_tradeTaken     = false;
          Print(">>> SIGNAL: EMA", EMA_Slow_Period, " crossed ABOVE EMA", EMA_Fast_Period, " -> SELL");
       }
       else if(currRelation == -1)
       {
          g_crossDir       = -1;
          g_barsSinceCross = 0;
-         g_tradeTaken     = false;
          Print(">>> SIGNAL: EMA", EMA_Slow_Period, " crossed BELOW EMA", EMA_Fast_Period, " -> BUY");
       }
    }
@@ -193,21 +198,15 @@ void OnTick()
    if(currRelation != 0)
       g_prevEMARelation = currRelation;
 
-   //--- Update chart comment
    UpdateChartComment(emaFast[0], emaSlow[0]);
 
-   //--- Increment bar counter for active signal
    if(g_crossDir != 0)
       g_barsSinceCross++;
 
-   //--- Check if we should look for entry
-   if(g_crossDir == 0)                         return;
-   if(g_barsSinceCross > Max_Candles)           return;
-   if(g_tradeTaken)                             return;
-   if(!IsTradingTime())                         return;
-   if(HasOpenPosition())                        return;
+   if(g_crossDir == 0)               return;
+   if(g_barsSinceCross > Max_Candles) return;
+   if(!IsTradingTime())               return;
 
-   //--- Analyze the completed candle (bar 1)
    double op  = iOpen(_Symbol, PERIOD_CURRENT, 1);
    double hi  = iHigh(_Symbol, PERIOD_CURRENT, 1);
    double lo  = iLow(_Symbol, PERIOD_CURRENT, 1);
@@ -221,51 +220,94 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| MANUAL SL: Check price on every tick and close if crossed          |
+//| MANUAL SL: Check each tracked position against its SL level       |
 //+------------------------------------------------------------------+
 void CheckManualSL()
 {
-   if(g_manualSL == 0 || g_tradeDir == 0) return;
-   if(!HasOpenPosition()) return;
+   if(g_tradeCount == 0) return;
 
-   if(g_tradeDir == 1)  // SELL position: close if Ask crosses above candle high
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   for(int i = g_tradeCount - 1; i >= 0; i--)
    {
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      if(ask >= g_manualSL)
+      if(g_trades[i].direction == 1)  // SELL: close if Ask >= SL
       {
-         Print(StringFormat("MANUAL SL HIT (Sell): Ask=%.2f >= SL=%.2f -> Closing", ask, g_manualSL));
-         CloseAllTrades();
-         g_manualSL = 0;
-         g_tradeDir = 0;
+         if(ask >= g_trades[i].slLevel)
+         {
+            Print(StringFormat("MANUAL SL HIT (Sell #%d): Ask=%.2f >= SL=%.2f",
+                  g_trades[i].ticket, ask, g_trades[i].slLevel));
+            g_trade.PositionClose(g_trades[i].ticket);
+            RemoveTrade(i);
+         }
       }
-   }
-   else if(g_tradeDir == -1)  // BUY position: close if Bid crosses below candle low
-   {
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      if(bid <= g_manualSL)
+      else if(g_trades[i].direction == -1)  // BUY: close if Bid <= SL
       {
-         Print(StringFormat("MANUAL SL HIT (Buy): Bid=%.2f <= SL=%.2f -> Closing", bid, g_manualSL));
-         CloseAllTrades();
-         g_manualSL = 0;
-         g_tradeDir = 0;
+         if(bid <= g_trades[i].slLevel)
+         {
+            Print(StringFormat("MANUAL SL HIT (Buy #%d): Bid=%.2f <= SL=%.2f",
+                  g_trades[i].ticket, bid, g_trades[i].slLevel));
+            g_trade.PositionClose(g_trades[i].ticket);
+            RemoveTrade(i);
+         }
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| SELL ENTRY: Wick dominance (upper wick > body AND lower wick)     |
-//| Candle must be above 33 EMA                                       |
-//|                                                                    |
+//| Remove trade from tracking array                                   |
+//+------------------------------------------------------------------+
+void RemoveTrade(int index)
+{
+   for(int i = index; i < g_tradeCount - 1; i++)
+      g_trades[i] = g_trades[i + 1];
+   g_tradeCount--;
+   ArrayResize(g_trades, g_tradeCount);
+}
+
+//+------------------------------------------------------------------+
+//| Remove trades closed by TP or externally                           |
+//+------------------------------------------------------------------+
+void CleanupClosedTrades()
+{
+   for(int i = g_tradeCount - 1; i >= 0; i--)
+   {
+      bool found = false;
+      for(int j = PositionsTotal() - 1; j >= 0; j--)
+      {
+         if(PositionGetTicket(j) == g_trades[i].ticket)
+         {
+            found = true;
+            break;
+         }
+      }
+      if(!found)
+         RemoveTrade(i);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Add trade to tracking array                                        |
+//+------------------------------------------------------------------+
+void AddTrade(ulong ticket, double slLevel, int direction)
+{
+   g_tradeCount++;
+   ArrayResize(g_trades, g_tradeCount);
+   g_trades[g_tradeCount - 1].ticket    = ticket;
+   g_trades[g_tradeCount - 1].slLevel   = slLevel;
+   g_trades[g_tradeCount - 1].direction = direction;
+}
+
+//+------------------------------------------------------------------+
+//| SELL ENTRY                                                         |
 //| Bear candle: (H-O) > (O-C) AND (H-O) > (C-L)                    |
 //| Bull candle: (H-C) > (C-O) AND (H-C) > (O-L)                    |
 //+------------------------------------------------------------------+
 void CheckSellEntry(double op, double hi, double lo, double cl, double ema33)
 {
-   //--- Candle High must be the highest of previous N candles
    if(!IsHighestHigh(hi, 1))
       return;
 
-   //--- Candle must be above the 33 EMA
    if(MathMin(op, cl) < ema33)
       return;
 
@@ -274,67 +316,53 @@ void CheckSellEntry(double op, double hi, double lo, double cl, double ema33)
 
    if(isBear)
    {
-      upperWick = hi - op;     // (H - O)
-      body      = op - cl;     // (O - C)
-      lowerWick = cl - lo;     // (C - L)
-
-      //--- (H-O) > (O-C) AND (H-O) > (C-L)
+      upperWick = hi - op;
+      body      = op - cl;
+      lowerWick = cl - lo;
       if(upperWick <= body || upperWick <= lowerWick) return;
    }
    else
    {
-      upperWick = hi - cl;     // (H - C)
-      body      = cl - op;     // (C - O)
-      lowerWick = op - lo;     // (O - L)
-
-      //--- (H-C) > (C-O) AND (H-C) > (O-L)
+      upperWick = hi - cl;
+      body      = cl - op;
+      lowerWick = op - lo;
       if(upperWick <= body || upperWick <= lowerWick) return;
    }
 
    if(upperWick <= 0) return;
 
-   //--- SL distance = High - Close (for lot calculation)
-   double slDistance = hi - cl;
-   if(slDistance <= 0) slDistance = hi - op;
+   //--- Hidden SL = candle high + 3 points buffer
+   double slLevel = NormalizeDouble(hi + SL_Buffer_Points * _Point, _Digits);
 
-   //--- TP = 5x the upper wick distance from entry
+   //--- TP = 5x wick distance below close
    double tp = NormalizeDouble(cl - (TP_Multiplier * upperWick), _Digits);
 
-   //--- Calculate lot from risk amount and SL distance
-   double lot = CalcLotFromRisk(slDistance);
-
-   //--- Place sell order (NO SL on order, TP only)
+   //--- Calculate lot using OrderCalcProfit
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double lot = CalcLotFromRisk(price, slLevel, true);
 
    if(g_trade.Sell(lot, _Symbol, price, 0, tp,
-      StringFormat("EMA%d/%d Sell | Risk:$%.0f", EMA_Fast_Period, EMA_Slow_Period, Risk_Amount)))
+      StringFormat("EMA%d/%d Sell|Risk$%.0f", EMA_Fast_Period, EMA_Slow_Period, Risk_Amount)))
    {
-      g_tradeTaken = true;
-      g_manualSL   = NormalizeDouble(hi, _Digits);  // Hidden SL at candle High
-      g_tradeDir   = 1;
-      Print(StringFormat("SELL OPENED: Price=%.2f Lot=%.2f HiddenSL=%.2f TP=%.2f SLdist=%.2f Risk=$%.2f",
-            price, lot, g_manualSL, tp, slDistance, Risk_Amount));
+      ulong ticket = g_trade.ResultOrder();
+      AddTrade(ticket, slLevel, 1);
+      Print(StringFormat("SELL #%d: Price=%.2f Lot=%.2f SL=%.2f TP=%.2f Risk=$%.2f",
+            ticket, price, lot, slLevel, tp, Risk_Amount));
    }
    else
-   {
-      Print("SELL FAILED: Error ", g_trade.ResultRetcode(), " - ", g_trade.ResultRetcodeDescription());
-   }
+      Print("SELL FAILED: ", g_trade.ResultRetcode(), " - ", g_trade.ResultRetcodeDescription());
 }
 
 //+------------------------------------------------------------------+
-//| BUY ENTRY: Wick dominance (lower wick > body AND upper wick)     |
-//| Candle must be below 33 EMA                                       |
-//|                                                                    |
+//| BUY ENTRY                                                          |
 //| Bear candle: (C-L) > (O-C) AND (C-L) > (H-O)                    |
 //| Bull candle: (O-L) > (C-O) AND (O-L) > (H-C)                    |
 //+------------------------------------------------------------------+
 void CheckBuyEntry(double op, double hi, double lo, double cl, double ema33)
 {
-   //--- Candle Low must be the lowest of previous N candles
    if(!IsLowestLow(lo, 1))
       return;
 
-   //--- Candle must be below the 33 EMA
    if(MathMax(op, cl) > ema33)
       return;
 
@@ -343,51 +371,41 @@ void CheckBuyEntry(double op, double hi, double lo, double cl, double ema33)
 
    if(isBear)
    {
-      lowerWick = cl - lo;     // (C - L)
-      body      = op - cl;     // (O - C)
-      upperWick = hi - op;     // (H - O)
-
-      //--- (C-L) > (O-C) AND (C-L) > (H-O)
+      lowerWick = cl - lo;
+      body      = op - cl;
+      upperWick = hi - op;
       if(lowerWick <= body || lowerWick <= upperWick) return;
    }
    else
    {
-      lowerWick = op - lo;     // (O - L)
-      body      = cl - op;     // (C - O)
-      upperWick = hi - cl;     // (H - C)
-
-      //--- (O-L) > (C-O) AND (O-L) > (H-C)
+      lowerWick = op - lo;
+      body      = cl - op;
+      upperWick = hi - cl;
       if(lowerWick <= body || lowerWick <= upperWick) return;
    }
 
    if(lowerWick <= 0) return;
 
-   //--- SL distance = Close - Low (for lot calculation)
-   double slDistance = cl - lo;
-   if(slDistance <= 0) slDistance = op - lo;
+   //--- Hidden SL = candle low - 3 points buffer
+   double slLevel = NormalizeDouble(lo - SL_Buffer_Points * _Point, _Digits);
 
-   //--- TP = 5x the lower wick distance from entry
+   //--- TP = 5x wick distance above close
    double tp = NormalizeDouble(cl + (TP_Multiplier * lowerWick), _Digits);
 
-   //--- Calculate lot from risk amount and SL distance
-   double lot = CalcLotFromRisk(slDistance);
-
-   //--- Place buy order (NO SL on order, TP only)
+   //--- Calculate lot using OrderCalcProfit
    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double lot = CalcLotFromRisk(price, slLevel, false);
 
    if(g_trade.Buy(lot, _Symbol, price, 0, tp,
-      StringFormat("EMA%d/%d Buy | Risk:$%.0f", EMA_Fast_Period, EMA_Slow_Period, Risk_Amount)))
+      StringFormat("EMA%d/%d Buy|Risk$%.0f", EMA_Fast_Period, EMA_Slow_Period, Risk_Amount)))
    {
-      g_tradeTaken = true;
-      g_manualSL   = NormalizeDouble(lo, _Digits);  // Hidden SL at candle Low
-      g_tradeDir   = -1;
-      Print(StringFormat("BUY OPENED: Price=%.2f Lot=%.2f HiddenSL=%.2f TP=%.2f SLdist=%.2f Risk=$%.2f",
-            price, lot, g_manualSL, tp, slDistance, Risk_Amount));
+      ulong ticket = g_trade.ResultOrder();
+      AddTrade(ticket, slLevel, -1);
+      Print(StringFormat("BUY #%d: Price=%.2f Lot=%.2f SL=%.2f TP=%.2f Risk=$%.2f",
+            ticket, price, lot, slLevel, tp, Risk_Amount));
    }
    else
-   {
-      Print("BUY FAILED: Error ", g_trade.ResultRetcode(), " - ", g_trade.ResultRetcodeDescription());
-   }
+      Print("BUY FAILED: ", g_trade.ResultRetcode(), " - ", g_trade.ResultRetcodeDescription());
 }
 
 //+------------------------------------------------------------------+
@@ -467,24 +485,6 @@ bool IsCloseTime()
 }
 
 //+------------------------------------------------------------------+
-//| Check for open positions with this magic number                    |
-//+------------------------------------------------------------------+
-bool HasOpenPosition()
-{
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket > 0)
-      {
-         if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
-            PositionGetInteger(POSITION_MAGIC) == Magic_Number)
-            return true;
-      }
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
 //| Close all positions with this magic number                         |
 //+------------------------------------------------------------------+
 void CloseAllTrades()
@@ -507,7 +507,7 @@ void CloseAllTrades()
 }
 
 //+------------------------------------------------------------------+
-//| Update chart comment with EA status                                |
+//| Update chart comment                                               |
 //+------------------------------------------------------------------+
 void UpdateChartComment(double emaFastVal, double emaSlowVal)
 {
@@ -516,9 +516,7 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    if(g_crossDir == -1) signal = "BUY";
 
    string status = "";
-   if(g_tradeTaken)
-      status = " [Trade Taken]";
-   else if(g_crossDir != 0 && g_barsSinceCross <= Max_Candles)
+   if(g_crossDir != 0 && g_barsSinceCross <= Max_Candles)
       status = StringFormat(" [Scanning %d/%d]", g_barsSinceCross, Max_Candles);
    else if(g_crossDir != 0 && g_barsSinceCross > Max_Candles)
       status = " [Window Expired]";
@@ -526,24 +524,28 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    string tradingStatus = IsTradingTime() ? "ACTIVE" : "PAUSED";
    if(IsCloseTime()) tradingStatus = "CLOSING";
 
-   string slInfo = "";
-   if(g_manualSL != 0)
-      slInfo = StringFormat("\nHidden SL: %.2f (%s)", g_manualSL, g_tradeDir == 1 ? "Sell" : "Buy");
+   string tradeInfo = "";
+   if(g_tradeCount > 0)
+   {
+      tradeInfo = StringFormat("\nActive Trades: %d", g_tradeCount);
+      for(int i = 0; i < g_tradeCount && i < 5; i++)
+         tradeInfo += StringFormat("\n  #%d SL:%.2f (%s)",
+            g_trades[i].ticket, g_trades[i].slLevel,
+            g_trades[i].direction == 1 ? "Sell" : "Buy");
+   }
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v1.7 ======\n"
+      "====== EMA Crossover EA v1.8 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
-      "Risk per trade: $%.2f\n"
+      "Risk: $%.2f  |  SL Buffer: %.0f pts\n"
       "Signal: %s%s\n"
-      "Trading: %s\n"
-      "Open Positions: %s%s\n"
+      "Trading: %s%s\n"
       "===================================",
       EMA_Fast_Period, emaFastVal, EMA_Slow_Period, emaSlowVal,
-      Risk_Amount,
+      Risk_Amount, SL_Buffer_Points,
       signal, status,
       tradingStatus,
-      HasOpenPosition() ? "Yes" : "No",
-      slInfo
+      tradeInfo
    ));
 }
 //+------------------------------------------------------------------+
