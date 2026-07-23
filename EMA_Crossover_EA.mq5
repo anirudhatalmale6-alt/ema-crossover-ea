@@ -1,13 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                          EMA_Crossover_EA.mq5     |
 //|                                          Copyright 2026            |
-//|              EMA 100/200 Trend + RSI(3) Crossover Strategy         |
+//|        EMA 3/9 Cross + Pullback/Reclaim Pattern Entry             |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v2.1"
-#property version   "2.10"
-#property description "EMA 100/200 Trend + RSI(3) Crossover Entry"
-#property description "Designed for Gold (XAUUSD) on M1 timeframe"
-#property description "Configurable SL/TP in points. No EMA-250 exit."
+#property copyright "EMA Crossover EA v2.2"
+#property version   "2.20"
+#property description "EMA3 crosses EMA9, pullback candle through EMA9, reclaim candle = entry"
+#property description "Candle-close SL at 2-candle low/high, 1:1 TP, percentage-risk sizing"
 
 #include <Trade\Trade.mqh>
 
@@ -15,16 +14,17 @@
 //| Input Parameters                                                   |
 //+------------------------------------------------------------------+
 
-input group "══════ EMA Settings ══════"
-input int      EMA_Mid_Period    = 100;        // EMA Mid Period (trend filter)
-input int      EMA_Slow_Period   = 200;        // EMA Slow Period (trend filter)
-input int      Max_Candles       = 120;        // Max candles after cross for entry
-input bool     Block_If_EMA_Touched = true;    // Cancel signal if price touches EMAs after cross
+input group "══════ EMA / Pattern Settings ══════"
+input int      EMA_Fast_Period   = 3;          // EMA Fast Period (crosses)
+input int      EMA_Slow_Period   = 9;          // EMA Slow Period (reference)
+input int      Search_Window     = 3;          // Candles after cross to find pullback candle
+input bool     Enable_Buy        = true;       // Enable Buy setups
+input bool     Enable_Sell       = true;       // Enable Sell setups (mirror of buy)
 
-input group "══════ RSI Settings ══════"
-input int      RSI_Period        = 3;          // RSI Period
-input double   RSI_Buy_Level     = 7.0;        // RSI level for Buy (cross above)
-input double   RSI_Sell_Level    = 93.0;       // RSI level for Sell (cross below)
+input group "══════ Risk / Trade Settings ══════"
+input double   Risk_Percent      = 1.0;        // Risk per trade (% of balance) = SL distance
+input int      Magic_Number      = 202601;     // Magic Number
+input int      Max_Slippage      = 30;         // Maximum Slippage (points)
 
 input group "══════ Time Filter (Server Time) ══════"
 input int      Market_Open_Hour  = 1;          // Daily Market Open Hour
@@ -35,13 +35,6 @@ input int      Open_Delay_Min    = 60;         // Minutes after open to start tr
 input int      Close_Before_Min  = 10;         // Minutes before close to stop NEW entries
 input bool     Close_At_Market_End = false;    // Force-close open trades before market close
 
-input group "══════ Trade Settings ══════"
-input double   Lot_Size          = 0.01;       // Lot Size
-input double   Stop_Loss_Pts     = 0.0;        // Stop Loss (points, 0 = disabled)
-input double   Take_Profit_Pts   = 0.0;        // Take Profit (points, 0 = disabled)
-input int      Magic_Number      = 202601;     // Magic Number
-input int      Max_Slippage      = 30;         // Maximum Slippage (points)
-
 //+------------------------------------------------------------------+
 //| Trade tracking structure                                           |
 //+------------------------------------------------------------------+
@@ -49,22 +42,25 @@ struct TradeInfo
 {
    ulong  ticket;
    int    direction;   // 1 = sell, -1 = buy
+   double slLevel;     // candle-close stop level (2-candle low for buy / high for sell)
 };
 
 //+------------------------------------------------------------------+
 //| Global Variables                                                   |
 //+------------------------------------------------------------------+
 
-int    g_handleEMAMid;
+int    g_handleEMAFast;
 int    g_handleEMASlow;
-int    g_handleRSI;
 CTrade g_trade;
 
-datetime g_lastBarTime    = 0;
-int      g_crossDir       = 0;     // 1 = sell signal (100 below 200), -1 = buy signal (100 above 200)
-int      g_barsSinceCross = 0;
-int      g_prevEMARelation= 0;     // 1 = 100 > 200 (bullish), -1 = 100 < 200 (bearish)
-bool     g_emaTouched     = false; // price touched an EMA since the cross
+datetime g_lastBarTime  = 0;
+
+// Setup state machine
+int    g_pendingDir     = 0;   // 1 = buy setup active, -1 = sell setup active, 0 = idle
+int    g_phase          = 0;   // 0 = idle, 1 = searching for pullback candle A, 2 = waiting for reclaim candle B
+int    g_barsInSearch   = 0;   // candles counted while searching for candle A
+double g_candleA_low    = 0.0; // low of pullback candle (buy)
+double g_candleA_high   = 0.0; // high of pullback candle (sell)
 
 TradeInfo g_trades[];
 int       g_tradeCount = 0;
@@ -74,12 +70,10 @@ int       g_tradeCount = 0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   g_handleEMAMid  = iMA(_Symbol, PERIOD_CURRENT, EMA_Mid_Period, 0, MODE_EMA, PRICE_CLOSE);
+   g_handleEMAFast = iMA(_Symbol, PERIOD_CURRENT, EMA_Fast_Period, 0, MODE_EMA, PRICE_CLOSE);
    g_handleEMASlow = iMA(_Symbol, PERIOD_CURRENT, EMA_Slow_Period, 0, MODE_EMA, PRICE_CLOSE);
-   g_handleRSI     = iRSI(_Symbol, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
 
-   if(g_handleEMAMid == INVALID_HANDLE || g_handleEMASlow == INVALID_HANDLE ||
-      g_handleRSI == INVALID_HANDLE)
+   if(g_handleEMAFast == INVALID_HANDLE || g_handleEMASlow == INVALID_HANDLE)
    {
       Print("ERROR: Failed to create indicators");
       return INIT_FAILED;
@@ -88,27 +82,16 @@ int OnInit()
    g_trade.SetExpertMagicNumber(Magic_Number);
    g_trade.SetDeviationInPoints(Max_Slippage);
 
-   double emaMid[2], emaSlow[2];
-   if(CopyBuffer(g_handleEMAMid, 0, 1, 2, emaMid) >= 2 &&
-      CopyBuffer(g_handleEMASlow, 0, 1, 2, emaSlow) >= 2)
-   {
-      ArraySetAsSeries(emaMid, true);
-      ArraySetAsSeries(emaSlow, true);
-      if(emaMid[0] > emaSlow[0])      g_prevEMARelation = 1;
-      else if(emaMid[0] < emaSlow[0]) g_prevEMARelation = -1;
-   }
-
-   g_tradeCount = 0;
+   g_pendingDir  = 0;
+   g_phase       = 0;
+   g_tradeCount  = 0;
    ArrayResize(g_trades, 0);
 
-   Print("EMA Crossover EA v2.1 initialized | EMA ", EMA_Mid_Period, "/", EMA_Slow_Period,
-         " | RSI(", RSI_Period, ") Buy<", DoubleToString(RSI_Buy_Level, 1),
-         " Sell>", DoubleToString(RSI_Sell_Level, 1),
-         " | Lot: ", DoubleToString(Lot_Size, 2),
-         " | SL: ", (Stop_Loss_Pts > 0 ? DoubleToString(Stop_Loss_Pts, 1) + " pts" : "OFF"),
-         " | TP: ", (Take_Profit_Pts > 0 ? DoubleToString(Take_Profit_Pts, 1) + " pts" : "OFF"),
-         " | Window: ", Max_Candles, " bars",
-         " | EMA-touch block: ", (Block_If_EMA_Touched ? "ON" : "OFF"),
+   Print("EMA Crossover EA v2.2 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+         " | Search window: ", Search_Window, " candles",
+         " | Risk: ", DoubleToString(Risk_Percent, 2), "%",
+         " | Buy: ", (Enable_Buy ? "ON" : "OFF"),
+         " | Sell: ", (Enable_Sell ? "ON" : "OFF"),
          " | Magic: ", Magic_Number);
 
    return INIT_SUCCEEDED;
@@ -119,9 +102,8 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(g_handleEMAMid  != INVALID_HANDLE) IndicatorRelease(g_handleEMAMid);
+   if(g_handleEMAFast != INVALID_HANDLE) IndicatorRelease(g_handleEMAFast);
    if(g_handleEMASlow != INVALID_HANDLE) IndicatorRelease(g_handleEMASlow);
-   if(g_handleRSI     != INVALID_HANDLE) IndicatorRelease(g_handleRSI);
    Comment("");
 }
 
@@ -144,126 +126,161 @@ void OnTick()
    if(!newBar) return;
    g_lastBarTime = barTime;
 
-   //--- Get indicator values
-   double emaMid[3], emaSlow[3], rsi[3];
-   if(CopyBuffer(g_handleEMAMid,  0, 0, 3, emaMid)  < 3) return;
+   //--- Get indicator values (bar 1 = last closed candle)
+   double emaFast[3], emaSlow[3];
+   if(CopyBuffer(g_handleEMAFast, 0, 0, 3, emaFast) < 3) return;
    if(CopyBuffer(g_handleEMASlow, 0, 0, 3, emaSlow) < 3) return;
-   if(CopyBuffer(g_handleRSI,     0, 0, 3, rsi)     < 3) return;
-   ArraySetAsSeries(emaMid,  true);
+   ArraySetAsSeries(emaFast, true);
    ArraySetAsSeries(emaSlow, true);
-   ArraySetAsSeries(rsi,     true);
 
+   //--- Manage open trades (candle-close stop)
+   ManageOpenTrades();
    CleanupClosedTrades();
 
-   //--- Detect EMA 100/200 crossover (using bar 1 = last closed bar)
-   int currRelation = 0;
-   if(emaMid[1] > emaSlow[1])      currRelation = 1;   // 100 above 200 = bullish
-   else if(emaMid[1] < emaSlow[1]) currRelation = -1;  // 100 below 200 = bearish
+   //--- Last closed candle OHLC
+   double o1 = iOpen(_Symbol,  PERIOD_CURRENT, 1);
+   double h1 = iHigh(_Symbol,  PERIOD_CURRENT, 1);
+   double l1 = iLow(_Symbol,   PERIOD_CURRENT, 1);
+   double c1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double ema9 = emaSlow[1];
 
-   if(g_prevEMARelation != 0 && currRelation != 0 && g_prevEMARelation != currRelation)
+   //--- Detect EMA3/EMA9 cross on the just-closed candle
+   bool crossUp = (emaFast[2] <= emaSlow[2] && emaFast[1] >  emaSlow[1]);
+   bool crossDn = (emaFast[2] >= emaSlow[2] && emaFast[1] <  emaSlow[1]);
+
+   bool freshCross = false;
+   if(crossUp && Enable_Buy)
    {
-      if(currRelation == 1)
-      {
-         g_crossDir       = -1;   // EMA100 crossed above EMA200 -> BUY signal
-         g_barsSinceCross = 0;
-         g_emaTouched     = false;
-         Print(">>> SIGNAL: EMA", EMA_Mid_Period, " crossed ABOVE EMA", EMA_Slow_Period, " -> BUY");
-      }
-      else if(currRelation == -1)
-      {
-         g_crossDir       = 1;    // EMA100 crossed below EMA200 -> SELL signal
-         g_barsSinceCross = 0;
-         g_emaTouched     = false;
-         Print(">>> SIGNAL: EMA", EMA_Mid_Period, " crossed BELOW EMA", EMA_Slow_Period, " -> SELL");
-      }
+      g_pendingDir   = 1;
+      g_phase        = 1;
+      g_barsInSearch = 0;
+      freshCross     = true;
+      Print(">>> EMA", EMA_Fast_Period, " crossed ABOVE EMA", EMA_Slow_Period, " -> looking for BUY pullback");
+   }
+   else if(crossDn && Enable_Sell)
+   {
+      g_pendingDir   = -1;
+      g_phase        = 1;
+      g_barsInSearch = 0;
+      freshCross     = true;
+      Print(">>> EMA", EMA_Fast_Period, " crossed BELOW EMA", EMA_Slow_Period, " -> looking for SELL pullback");
    }
 
-   if(currRelation != 0)
-      g_prevEMARelation = currRelation;
+   //--- Evaluate the pattern (skip the cross candle itself)
+   if(!freshCross && g_pendingDir != 0)
+      EvaluatePattern(o1, h1, l1, c1, ema9);
 
-   if(g_crossDir != 0)
-      g_barsSinceCross++;
+   UpdateChartComment(emaFast[1], emaSlow[1]);
+}
 
-   //--- After the cross: cancel the setup if price touches either EMA
-   //--- (checked on the last closed candle, skipping the cross candle itself)
-   if(g_crossDir != 0 && Block_If_EMA_Touched && g_barsSinceCross >= 1)
+//+------------------------------------------------------------------+
+//| Walk the pullback -> reclaim state machine                        |
+//+------------------------------------------------------------------+
+void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
+{
+   if(!IsTradingTime())
    {
-      double hi1 = iHigh(_Symbol, PERIOD_CURRENT, 1);
-      double lo1 = iLow(_Symbol, PERIOD_CURRENT, 1);
-      if(CandleTouchesLevel(hi1, lo1, emaMid[1]) || CandleTouchesLevel(hi1, lo1, emaSlow[1]))
+      // still advance the search window so a stale setup expires naturally
+   }
+
+   //================= BUY SETUP =================
+   if(g_pendingDir == 1)
+   {
+      if(g_phase == 1)   // searching for the bearish pullback candle A
       {
-         if(!g_emaTouched)
-            Print(">>> Setup CANCELLED: price touched an EMA after the cross (no entry until next cross)");
-         g_emaTouched = true;
+         g_barsInSearch++;
+         if(g_barsInSearch > Search_Window)
+         {
+            ResetSetup(); // no pullback candle within window
+            return;
+         }
+         // Candle A: bearish, opens above EMA9, closes below EMA9
+         if(c1 < o1 && o1 > ema9 && c1 < ema9)
+         {
+            g_candleA_low = l1;
+            g_phase = 2;
+         }
+      }
+      else if(g_phase == 2)  // the very next candle must reclaim: open below EMA9, close above EMA9
+      {
+         if(o1 < ema9 && c1 > ema9)
+         {
+            double slLevel  = MathMin(g_candleA_low, l1);  // lowest low of the two candles
+            double riskDist = c1 - slLevel;                // second candle close - lowest low
+            double tp       = c1 + riskDist;               // 1:1 reward
+            if(riskDist > 0 && IsTradingTime())
+               ExecuteBuy(slLevel, tp, riskDist);
+         }
+         ResetSetup(); // reclaim candle is the decider either way
       }
    }
-
-   UpdateChartComment(emaMid[0], emaSlow[0], rsi[0]);
-
-   if(g_crossDir == 0)                return;
-   if(g_barsSinceCross > Max_Candles) return;
-   if(g_emaTouched)                   return;
-   if(!IsTradingTime())               return;
-
-   //--- Entry candle data (bar 1 = last closed candle)
-   double cl     = iClose(_Symbol, PERIOD_CURRENT, 1);
-   double ema100 = emaMid[1];
-
-   //--- RSI crossover check: bar 2 = previous RSI, bar 1 = current RSI
-   double rsiPrev = rsi[2];
-   double rsiCurr = rsi[1];
-
-   if(g_crossDir == -1)  // BUY signal
+   //================= SELL SETUP (mirror) =================
+   else if(g_pendingDir == -1)
    {
-      // Price must be above EMA 100
-      if(cl <= ema100) return;
-
-      // RSI(3) must cross above buy level (was below, now above)
-      if(!(rsiPrev <= RSI_Buy_Level && rsiCurr > RSI_Buy_Level)) return;
-
-      ExecuteBuy();
-   }
-   else if(g_crossDir == 1)  // SELL signal
-   {
-      // Price must be below EMA 100
-      if(cl >= ema100) return;
-
-      // RSI(3) must cross below sell level (was above, now below)
-      if(!(rsiPrev >= RSI_Sell_Level && rsiCurr < RSI_Sell_Level)) return;
-
-      ExecuteSell();
+      if(g_phase == 1)   // searching for the bullish pullback candle A
+      {
+         g_barsInSearch++;
+         if(g_barsInSearch > Search_Window)
+         {
+            ResetSetup();
+            return;
+         }
+         // Candle A: bullish, opens below EMA9, closes above EMA9
+         if(c1 > o1 && o1 < ema9 && c1 > ema9)
+         {
+            g_candleA_high = h1;
+            g_phase = 2;
+         }
+      }
+      else if(g_phase == 2)  // reclaim: open above EMA9, close below EMA9
+      {
+         if(o1 > ema9 && c1 < ema9)
+         {
+            double slLevel  = MathMax(g_candleA_high, h1); // highest high of the two candles
+            double riskDist = slLevel - c1;                // highest high - second candle close
+            double tp       = c1 - riskDist;               // 1:1 reward
+            if(riskDist > 0 && IsTradingTime())
+               ExecuteSell(slLevel, tp, riskDist);
+         }
+         ResetSetup();
+      }
    }
 }
 
 //+------------------------------------------------------------------+
-//| True if a candle's range touches/crosses a price level            |
+//| Reset the setup state machine                                     |
 //+------------------------------------------------------------------+
-bool CandleTouchesLevel(double high, double low, double level)
+void ResetSetup()
 {
-   return (low <= level && high >= level);
+   g_pendingDir   = 0;
+   g_phase        = 0;
+   g_barsInSearch = 0;
+   g_candleA_low  = 0.0;
+   g_candleA_high = 0.0;
 }
 
 //+------------------------------------------------------------------+
 //| Execute BUY trade                                                  |
 //+------------------------------------------------------------------+
-void ExecuteBuy()
+void ExecuteBuy(double slLevel, double tpLevel, double riskDist)
 {
+   double lot = CalcLotByRisk(riskDist);
+   if(lot <= 0)
+   {
+      Print("BUY skipped: could not size lot (risk distance ", DoubleToString(riskDist, _Digits), ")");
+      return;
+   }
+
    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double lot = NormalizeLot(Lot_Size);
+   double tp    = NormalizeDouble(tpLevel, _Digits);
 
-   double sl = 0, tp = 0;
-   if(Stop_Loss_Pts > 0)
-      sl = NormalizeDouble(price - Stop_Loss_Pts * _Point, _Digits);
-   if(Take_Profit_Pts > 0)
-      tp = NormalizeDouble(price + Take_Profit_Pts * _Point, _Digits);
-
-   if(g_trade.Buy(lot, _Symbol, price, sl, tp,
-      StringFormat("EMA%d/%d RSI Buy", EMA_Mid_Period, EMA_Slow_Period)))
+   // TP as hard order level (broker closes when reached); SL handled on candle close by EA
+   if(g_trade.Buy(lot, _Symbol, price, 0, tp, "EMA3/9 Reclaim Buy"))
    {
       ulong ticket = g_trade.ResultOrder();
-      AddTrade(ticket, -1);
-      Print(StringFormat("BUY #%d: Price=%.2f Lot=%.2f SL=%.2f TP=%.2f",
-            ticket, price, lot, sl, tp));
+      AddTrade(ticket, -1, slLevel);
+      Print(StringFormat("BUY #%d: Price=%.2f Lot=%.2f SLclose=%.2f TP=%.2f RiskDist=%.2f",
+            ticket, price, lot, slLevel, tp, riskDist));
    }
    else
       Print("BUY FAILED: ", g_trade.ResultRetcode(), " - ", g_trade.ResultRetcodeDescription());
@@ -272,27 +289,88 @@ void ExecuteBuy()
 //+------------------------------------------------------------------+
 //| Execute SELL trade                                                 |
 //+------------------------------------------------------------------+
-void ExecuteSell()
+void ExecuteSell(double slLevel, double tpLevel, double riskDist)
 {
+   double lot = CalcLotByRisk(riskDist);
+   if(lot <= 0)
+   {
+      Print("SELL skipped: could not size lot (risk distance ", DoubleToString(riskDist, _Digits), ")");
+      return;
+   }
+
    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double lot = NormalizeLot(Lot_Size);
+   double tp    = NormalizeDouble(tpLevel, _Digits);
 
-   double sl = 0, tp = 0;
-   if(Stop_Loss_Pts > 0)
-      sl = NormalizeDouble(price + Stop_Loss_Pts * _Point, _Digits);
-   if(Take_Profit_Pts > 0)
-      tp = NormalizeDouble(price - Take_Profit_Pts * _Point, _Digits);
-
-   if(g_trade.Sell(lot, _Symbol, price, sl, tp,
-      StringFormat("EMA%d/%d RSI Sell", EMA_Mid_Period, EMA_Slow_Period)))
+   if(g_trade.Sell(lot, _Symbol, price, 0, tp, "EMA3/9 Reclaim Sell"))
    {
       ulong ticket = g_trade.ResultOrder();
-      AddTrade(ticket, 1);
-      Print(StringFormat("SELL #%d: Price=%.2f Lot=%.2f SL=%.2f TP=%.2f",
-            ticket, price, lot, sl, tp));
+      AddTrade(ticket, 1, slLevel);
+      Print(StringFormat("SELL #%d: Price=%.2f Lot=%.2f SLclose=%.2f TP=%.2f RiskDist=%.2f",
+            ticket, price, lot, slLevel, tp, riskDist));
    }
    else
       Print("SELL FAILED: ", g_trade.ResultRetcode(), " - ", g_trade.ResultRetcodeDescription());
+}
+
+//+------------------------------------------------------------------+
+//| Candle-close stop: close trade when a candle closes beyond level  |
+//+------------------------------------------------------------------+
+void ManageOpenTrades()
+{
+   if(g_tradeCount == 0) return;
+
+   double c1 = iClose(_Symbol, PERIOD_CURRENT, 1);  // last closed candle
+
+   for(int i = g_tradeCount - 1; i >= 0; i--)
+   {
+      // verify position still exists
+      if(!PositionSelectByTicket(g_trades[i].ticket))
+      {
+         RemoveTrade(i);
+         continue;
+      }
+
+      if(g_trades[i].direction == -1)  // BUY: close if candle closes below SL level
+      {
+         if(c1 < g_trades[i].slLevel)
+         {
+            Print(StringFormat("SL EXIT (Buy #%d): candle closed %.2f below level %.2f",
+                  g_trades[i].ticket, c1, g_trades[i].slLevel));
+            g_trade.PositionClose(g_trades[i].ticket);
+            RemoveTrade(i);
+         }
+      }
+      else if(g_trades[i].direction == 1)  // SELL: close if candle closes above SL level
+      {
+         if(c1 > g_trades[i].slLevel)
+         {
+            Print(StringFormat("SL EXIT (Sell #%d): candle closed %.2f above level %.2f",
+                  g_trades[i].ticket, c1, g_trades[i].slLevel));
+            g_trade.PositionClose(g_trades[i].ticket);
+            RemoveTrade(i);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Percentage-risk lot sizing (risk = SL distance)                   |
+//+------------------------------------------------------------------+
+double CalcLotByRisk(double riskDistancePrice)
+{
+   double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskMoney = balance * Risk_Percent / 100.0;
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+
+   if(tickSize <= 0 || tickValue <= 0 || riskDistancePrice <= 0 || riskMoney <= 0)
+      return 0;
+
+   double lossPerLot = (riskDistancePrice / tickSize) * tickValue;
+   if(lossPerLot <= 0) return 0;
+
+   double lot = riskMoney / lossPerLot;
+   return NormalizeLot(lot);
 }
 
 //+------------------------------------------------------------------+
@@ -307,22 +385,13 @@ void RemoveTrade(int index)
 }
 
 //+------------------------------------------------------------------+
-//| Remove trades closed externally (SL/TP hit, manual close)          |
+//| Remove trades closed externally (TP hit, manual close)             |
 //+------------------------------------------------------------------+
 void CleanupClosedTrades()
 {
    for(int i = g_tradeCount - 1; i >= 0; i--)
    {
-      bool found = false;
-      for(int j = PositionsTotal() - 1; j >= 0; j--)
-      {
-         if(PositionGetTicket(j) == g_trades[i].ticket)
-         {
-            found = true;
-            break;
-         }
-      }
-      if(!found)
+      if(!PositionSelectByTicket(g_trades[i].ticket))
          RemoveTrade(i);
    }
 }
@@ -330,12 +399,13 @@ void CleanupClosedTrades()
 //+------------------------------------------------------------------+
 //| Add trade to tracking array                                        |
 //+------------------------------------------------------------------+
-void AddTrade(ulong ticket, int direction)
+void AddTrade(ulong ticket, int direction, double slLevel)
 {
    g_tradeCount++;
    ArrayResize(g_trades, g_tradeCount);
    g_trades[g_tradeCount - 1].ticket    = ticket;
    g_trades[g_tradeCount - 1].direction = direction;
+   g_trades[g_tradeCount - 1].slLevel   = slLevel;
 }
 
 //+------------------------------------------------------------------+
@@ -413,19 +483,17 @@ void CloseAllTrades()
 //+------------------------------------------------------------------+
 //| Update chart comment                                               |
 //+------------------------------------------------------------------+
-void UpdateChartComment(double emaMidVal, double emaSlowVal, double rsiVal)
+void UpdateChartComment(double emaFastVal, double emaSlowVal)
 {
-   string signal = "None";
-   if(g_crossDir == 1)  signal = "SELL";
-   if(g_crossDir == -1) signal = "BUY";
-
-   string status = "";
-   if(g_crossDir != 0 && g_emaTouched)
-      status = " [Cancelled: EMA touched]";
-   else if(g_crossDir != 0 && g_barsSinceCross <= Max_Candles)
-      status = StringFormat(" [Scanning %d/%d]", g_barsSinceCross, Max_Candles);
-   else if(g_crossDir != 0 && g_barsSinceCross > Max_Candles)
-      status = " [Window Expired]";
+   string setup = "Idle (waiting for EMA cross)";
+   if(g_pendingDir == 1)
+      setup = (g_phase == 1)
+              ? StringFormat("BUY: searching pullback %d/%d", g_barsInSearch, Search_Window)
+              : "BUY: waiting for reclaim candle";
+   else if(g_pendingDir == -1)
+      setup = (g_phase == 1)
+              ? StringFormat("SELL: searching pullback %d/%d", g_barsInSearch, Search_Window)
+              : "SELL: waiting for reclaim candle";
 
    string tradingStatus = IsTradingTime() ? "ACTIVE" : "PAUSED";
 
@@ -434,28 +502,23 @@ void UpdateChartComment(double emaMidVal, double emaSlowVal, double rsiVal)
    {
       tradeInfo = StringFormat("\nActive Trades: %d", g_tradeCount);
       for(int i = 0; i < g_tradeCount && i < 5; i++)
-         tradeInfo += StringFormat("\n  #%d (%s)",
+         tradeInfo += StringFormat("\n  #%d (%s) SL@%.2f",
             g_trades[i].ticket,
-            g_trades[i].direction == 1 ? "Sell" : "Buy");
+            g_trades[i].direction == 1 ? "Sell" : "Buy",
+            g_trades[i].slLevel);
    }
 
-   string slStr = (Stop_Loss_Pts > 0) ? DoubleToString(Stop_Loss_Pts, 1) + " pts" : "OFF";
-   string tpStr = (Take_Profit_Pts > 0) ? DoubleToString(Take_Profit_Pts, 1) + " pts" : "OFF";
-
    Comment(StringFormat(
-      "====== EMA Crossover EA v2.1 ======\n"
+      "====== EMA Crossover EA v2.2 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
-      "RSI(%d): %.2f  |  Buy<%.1f  Sell>%.1f\n"
-      "Lot: %.2f  |  SL: %s  |  TP: %s\n"
-      "Signal: %s%s\n"
-      "Trading: %s\n"
+      "Risk: %.2f%%  |  Buy:%s  Sell:%s\n"
+      "Setup: %s\n"
+      "Trading: %s%s\n"
       "===================================",
-      EMA_Mid_Period, emaMidVal, EMA_Slow_Period, emaSlowVal,
-      RSI_Period, rsiVal, RSI_Buy_Level, RSI_Sell_Level,
-      Lot_Size, slStr, tpStr,
-      signal, status,
-      tradingStatus,
-      tradeInfo
+      EMA_Fast_Period, emaFastVal, EMA_Slow_Period, emaSlowVal,
+      Risk_Percent, (Enable_Buy ? "on" : "off"), (Enable_Sell ? "on" : "off"),
+      setup,
+      tradingStatus, tradeInfo
    ));
 }
 //+------------------------------------------------------------------+
