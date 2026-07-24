@@ -3,8 +3,8 @@
 //|                                          Copyright 2026            |
 //|        EMA 3/9 Cross + Pullback/Reclaim Pattern Entry             |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v2.8"
-#property version   "2.80"
+#property copyright "EMA Crossover EA v2.9"
+#property version   "2.90"
 #property description "EMA3 crosses EMA9, pullback candle through EMA9, reclaim candle = entry"
 #property description "Candle-close SL at 2-candle low/high, 1:1 TP, percentage-risk sizing"
 
@@ -21,6 +21,7 @@ input int      Search_Start      = 1;          // First candle after cross to lo
 input int      Search_Window     = 3;          // Last candle after cross to look for pullback
 input bool     Enable_Buy        = true;       // Enable Buy setups
 input bool     Enable_Sell       = true;       // Enable Sell setups (mirror of buy)
+input bool     Trend_Filter      = true;       // Only buy if EMA3>EMA9 at entry, only sell if EMA3<EMA9 (with-trend)
 input bool     Verbose_Log       = true;       // Print each pullback/reclaim check to Experts log
 input bool     Draw_Markers      = true;       // Draw pullback (yellow) and entry (blue/red) arrows on chart
 
@@ -90,7 +91,7 @@ int OnInit()
    g_tradeCount  = 0;
    ArrayResize(g_trades, 0);
 
-   Print("EMA Crossover EA v2.8 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+   Print("EMA Crossover EA v2.9 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | Search window: ", Search_Start, "-", Search_Window, " candles",
          " | Risk: ", DoubleToString(Risk_Percent, 2), "%",
          " | Buy: ", (Enable_Buy ? "ON" : "OFF"),
@@ -178,7 +179,7 @@ void OnTick()
 
    //--- Evaluate the pattern (skip the cross candle itself)
    if(!freshCross && g_pendingDir != 0)
-      EvaluatePattern(o1, h1, l1, c1, ema9);
+      EvaluatePattern(o1, h1, l1, c1, ema9, emaFast[1]);
 
    UpdateChartComment(emaFast[1], emaSlow[1]);
 }
@@ -186,7 +187,7 @@ void OnTick()
 //+------------------------------------------------------------------+
 //| Walk the pullback -> reclaim state machine                        |
 //+------------------------------------------------------------------+
-void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
+void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9, double emaFastVal)
 {
    if(!IsTradingTime())
    {
@@ -228,7 +229,10 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
             Print(StringFormat("BUY reclaim chk: O=%.2f C=%.2f EMA9=%.2f | openBelow=%s closeAbove=%s -> %s",
                o1, c1, ema9, (o1<ema9?"Y":"N"), (c1>ema9?"Y":"N"),
                (isReclaim?"ENTRY":"no reclaim -> reset")));
-         if(isReclaim)
+         bool trendOK = (!Trend_Filter || emaFastVal > ema9);  // buy only with EMA3 above EMA9
+         if(isReclaim && !trendOK && Verbose_Log)
+            Print(StringFormat("BUY blocked by trend filter: EMA3=%.2f is not above EMA9=%.2f (counter-trend)", emaFastVal, ema9));
+         if(isReclaim && trendOK)
          {
             if(Draw_Markers)
                DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), l1, OBJ_ARROW_UP, clrDodgerBlue); // buy entry candle
@@ -278,7 +282,10 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
             Print(StringFormat("SELL reclaim chk: O=%.2f C=%.2f EMA9=%.2f | openAbove=%s closeBelow=%s -> %s",
                o1, c1, ema9, (o1>ema9?"Y":"N"), (c1<ema9?"Y":"N"),
                (isReclaim?"ENTRY":"no reclaim -> reset")));
-         if(isReclaim)
+         bool trendOK = (!Trend_Filter || emaFastVal < ema9);  // sell only with EMA3 below EMA9
+         if(isReclaim && !trendOK && Verbose_Log)
+            Print(StringFormat("SELL blocked by trend filter: EMA3=%.2f is not below EMA9=%.2f (counter-trend)", emaFastVal, ema9));
+         if(isReclaim && trendOK)
          {
             if(Draw_Markers)
                DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), h1, OBJ_ARROW_DOWN, clrRed); // sell entry candle
@@ -570,7 +577,7 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    }
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v2.8 ======\n"
+      "====== EMA Crossover EA v2.9 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
       "Risk: %.2f%%  |  Buy:%s  Sell:%s\n"
       "Setup: %s\n"
