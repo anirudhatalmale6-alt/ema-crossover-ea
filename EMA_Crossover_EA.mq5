@@ -3,8 +3,8 @@
 //|                                          Copyright 2026            |
 //|        EMA 3/9 Cross + Pullback/Reclaim Pattern Entry             |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v2.7"
-#property version   "2.70"
+#property copyright "EMA Crossover EA v2.8"
+#property version   "2.80"
 #property description "EMA3 crosses EMA9, pullback candle through EMA9, reclaim candle = entry"
 #property description "Candle-close SL at 2-candle low/high, 1:1 TP, percentage-risk sizing"
 
@@ -90,7 +90,7 @@ int OnInit()
    g_tradeCount  = 0;
    ArrayResize(g_trades, 0);
 
-   Print("EMA Crossover EA v2.7 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+   Print("EMA Crossover EA v2.8 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | Search window: ", Search_Start, "-", Search_Window, " candles",
          " | Risk: ", DoubleToString(Risk_Percent, 2), "%",
          " | Buy: ", (Enable_Buy ? "ON" : "OFF"),
@@ -151,22 +151,29 @@ void OnTick()
    bool crossUp = (emaFast[2] <= emaSlow[2] && emaFast[1] >  emaSlow[1]);
    bool crossDn = (emaFast[2] >= emaSlow[2] && emaFast[1] <  emaSlow[1]);
 
+   //--- Only look for a NEW cross when idle. Once a setup is active we must
+   //    IGNORE re-crosses, because the pullback candle (which pushes price back
+   //    through EMA9) naturally makes the fast EMA re-cross - and that must NOT
+   //    flip or restart the setup, or the entry direction gets corrupted.
    bool freshCross = false;
-   if(crossUp && Enable_Buy)
+   if(g_pendingDir == 0)
    {
-      g_pendingDir   = 1;
-      g_phase        = 1;
-      g_barsInSearch = 0;
-      freshCross     = true;
-      Print(">>> EMA", EMA_Fast_Period, " crossed ABOVE EMA", EMA_Slow_Period, " -> looking for BUY pullback");
-   }
-   else if(crossDn && Enable_Sell)
-   {
-      g_pendingDir   = -1;
-      g_phase        = 1;
-      g_barsInSearch = 0;
-      freshCross     = true;
-      Print(">>> EMA", EMA_Fast_Period, " crossed BELOW EMA", EMA_Slow_Period, " -> looking for SELL pullback");
+      if(crossUp && Enable_Buy)
+      {
+         g_pendingDir   = 1;
+         g_phase        = 1;
+         g_barsInSearch = 0;
+         freshCross     = true;
+         Print(">>> EMA", EMA_Fast_Period, " crossed ABOVE EMA", EMA_Slow_Period, " -> looking for BUY pullback");
+      }
+      else if(crossDn && Enable_Sell)
+      {
+         g_pendingDir   = -1;
+         g_phase        = 1;
+         g_barsInSearch = 0;
+         freshCross     = true;
+         Print(">>> EMA", EMA_Fast_Period, " crossed BELOW EMA", EMA_Slow_Period, " -> looking for SELL pullback");
+      }
    }
 
    //--- Evaluate the pattern (skip the cross candle itself)
@@ -563,7 +570,7 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    }
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v2.7 ======\n"
+      "====== EMA Crossover EA v2.8 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
       "Risk: %.2f%%  |  Buy:%s  Sell:%s\n"
       "Setup: %s\n"
