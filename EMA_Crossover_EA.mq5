@@ -3,8 +3,8 @@
 //|                                          Copyright 2026            |
 //|        EMA 3/9 Cross + Pullback/Reclaim Pattern Entry             |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v2.6"
-#property version   "2.60"
+#property copyright "EMA Crossover EA v2.7"
+#property version   "2.70"
 #property description "EMA3 crosses EMA9, pullback candle through EMA9, reclaim candle = entry"
 #property description "Candle-close SL at 2-candle low/high, 1:1 TP, percentage-risk sizing"
 
@@ -22,6 +22,7 @@ input int      Search_Window     = 3;          // Last candle after cross to loo
 input bool     Enable_Buy        = true;       // Enable Buy setups
 input bool     Enable_Sell       = true;       // Enable Sell setups (mirror of buy)
 input bool     Verbose_Log       = true;       // Print each pullback/reclaim check to Experts log
+input bool     Draw_Markers      = true;       // Draw pullback (yellow) and entry (blue/red) arrows on chart
 
 input group "══════ Risk / Trade Settings ══════"
 input double   Risk_Percent      = 1.0;        // Risk per trade (% of balance) = SL distance
@@ -89,7 +90,7 @@ int OnInit()
    g_tradeCount  = 0;
    ArrayResize(g_trades, 0);
 
-   Print("EMA Crossover EA v2.6 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+   Print("EMA Crossover EA v2.7 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | Search window: ", Search_Start, "-", Search_Window, " candles",
          " | Risk: ", DoubleToString(Risk_Percent, 2), "%",
          " | Buy: ", (Enable_Buy ? "ON" : "OFF"),
@@ -209,6 +210,8 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
          {
             g_candleA_low = l1;
             g_phase = 2;
+            if(Draw_Markers)
+               DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), h1, OBJ_ARROW_DOWN, clrYellow); // pullback candle
          }
       }
       else if(g_phase == 2)  // the very next candle must reclaim: open below EMA9, close above EMA9
@@ -220,6 +223,8 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
                (isReclaim?"ENTRY":"no reclaim -> reset")));
          if(isReclaim)
          {
+            if(Draw_Markers)
+               DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), l1, OBJ_ARROW_UP, clrDodgerBlue); // buy entry candle
             double slLevel  = MathMin(g_candleA_low, l1);  // lowest low of the two candles
             double riskDist = c1 - slLevel;                // second candle close - lowest low
             double tp       = c1 + riskDist;               // 1:1 reward
@@ -255,6 +260,8 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
          {
             g_candleA_high = h1;
             g_phase = 2;
+            if(Draw_Markers)
+               DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), l1, OBJ_ARROW_UP, clrYellow); // pullback candle
          }
       }
       else if(g_phase == 2)  // reclaim: open above EMA9, close below EMA9
@@ -266,6 +273,8 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
                (isReclaim?"ENTRY":"no reclaim -> reset")));
          if(isReclaim)
          {
+            if(Draw_Markers)
+               DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), h1, OBJ_ARROW_DOWN, clrRed); // sell entry candle
             double slLevel  = MathMax(g_candleA_high, h1); // highest high of the two candles
             double riskDist = slLevel - c1;                // highest high - second candle close
             double tp       = c1 - riskDist;               // 1:1 reward
@@ -277,6 +286,19 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
          ResetSetup();
       }
    }
+}
+
+//+------------------------------------------------------------------+
+//| Draw a marker arrow on a specific candle (for visual debugging)   |
+//+------------------------------------------------------------------+
+void DrawArrow(datetime t, double price, ENUM_OBJECT type, color clr)
+{
+   string name = "EMA_mk_" + IntegerToString((long)t) + "_" + IntegerToString((int)type);
+   if(ObjectFind(0, name) >= 0) return;
+   if(!ObjectCreate(0, name, type, 0, t, price)) return;
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
 }
 
 //+------------------------------------------------------------------+
@@ -541,7 +563,7 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    }
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v2.6 ======\n"
+      "====== EMA Crossover EA v2.7 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
       "Risk: %.2f%%  |  Buy:%s  Sell:%s\n"
       "Setup: %s\n"
