@@ -3,8 +3,8 @@
 //|                                          Copyright 2026            |
 //|        EMA 3/9 Cross + Pullback/Reclaim Pattern Entry             |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v3.7"
-#property version   "3.70"
+#property copyright "EMA Crossover EA v3.8"
+#property version   "3.80"
 #property description "EMA3 crosses EMA9, pullback candle through EMA9, reclaim candle = entry"
 #property description "Candle-close SL at 2-candle low/high, 1:1 TP, percentage-risk sizing"
 
@@ -18,7 +18,7 @@ input group "══════ EMA / Pattern Settings ══════"
 input int      EMA_Fast_Period   = 3;          // EMA Fast Period (crosses)
 input int      EMA_Slow_Period   = 9;          // EMA Slow Period (reference)
 input int      Search_Start      = 1;          // First candle after cross to look for pullback (1 = candle right after cross)
-input int      Search_Window     = 2;          // Entry must finish within this many candles AFTER the cross (2 = by 2nd candle after cross = "candle 3" counting the cross as candle 1)
+input int      Search_Window     = 4;          // Entry must finish within this many candles AFTER the cross (pullback allowed on candles 2-4, entry the next candle, counting the cross as candle 1)
 input bool     Enable_Buy        = true;       // Enable Buy setups
 input bool     Enable_Sell       = true;       // Enable Sell setups (mirror of buy)
 input bool     Trend_Filter      = false;      // OPTIONAL: buy only while EMA3>EMA9 / sell only while EMA3<EMA9. OFF = pure pattern (takes every valid pullback/reclaim)
@@ -95,7 +95,7 @@ int OnInit()
    g_tradeCount  = 0;
    ArrayResize(g_trades, 0);
 
-   Print("EMA Crossover EA v3.7 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+   Print("EMA Crossover EA v3.8 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | Search window: ", Search_Start, "-", Search_Window, " candles",
          " | Risk: ", DoubleToString(Risk_Percent, 2), "%",
          " | Buy: ", (Enable_Buy ? "ON" : "OFF"),
@@ -613,7 +613,7 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    }
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v3.7 ======\n"
+      "====== EMA Crossover EA v3.8 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
       "Risk: %.2f%%  |  Buy:%s  Sell:%s  Trend filter:%s\n"
       "Setup: %s\n"
