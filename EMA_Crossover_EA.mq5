@@ -3,10 +3,10 @@
 //|                                          Copyright 2026            |
 //|        EMA 3/9 Cross + Pullback/Reclaim Pattern Entry             |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v3.8"
-#property version   "3.80"
+#property copyright "EMA Crossover EA v3.9"
+#property version   "3.90"
 #property description "EMA3 crosses EMA9, pullback candle through EMA9, reclaim candle = entry"
-#property description "Candle-close SL at 2-candle low/high, 1:1 TP, percentage-risk sizing"
+#property description "Simple stateless if-checks: read straight off the last few candles"
 
 #include <Trade\Trade.mqh>
 
@@ -17,13 +17,13 @@
 input group "══════ EMA / Pattern Settings ══════"
 input int      EMA_Fast_Period   = 3;          // EMA Fast Period (crosses)
 input int      EMA_Slow_Period   = 9;          // EMA Slow Period (reference)
-input int      Search_Start      = 1;          // First candle after cross to look for pullback (1 = candle right after cross)
-input int      Search_Window     = 4;          // Entry must finish within this many candles AFTER the cross (pullback allowed on candles 2-4, entry the next candle, counting the cross as candle 1)
-input bool     Enable_Buy        = true;       // Enable Buy setups
-input bool     Enable_Sell       = true;       // Enable Sell setups (mirror of buy)
-input bool     Trend_Filter      = false;      // OPTIONAL: buy only while EMA3>EMA9 / sell only while EMA3<EMA9. OFF = pure pattern (takes every valid pullback/reclaim)
-input bool     Verbose_Log       = true;       // Print each pullback/reclaim check to Experts log
-input bool     Draw_Markers      = true;       // Draw pullback (yellow) and entry (blue/red) arrows on chart
+input int      Max_Pullback_Candle = 4;        // Latest candle the pullback may be (cross = candle 1, so 2..this)
+input bool     Enable_Buy        = true;       // Enable Buy entries
+input bool     Enable_Sell       = true;       // Enable Sell entries (mirror of buy)
+input bool     Trend_Filter      = false;      // OPTIONAL: buy only if EMA3>EMA9 / sell only if EMA3<EMA9 (off = pure pattern)
+input bool     One_Trade_At_A_Time = false;    // If true, skip new entries while a position is open (off = take every valid pattern)
+input bool     Verbose_Log       = true;       // Print each entry decision to the Experts log
+input bool     Draw_Markers      = true;       // Draw pullback (yellow) + entry (blue/red) arrows and value labels
 
 input group "══════ Risk / Trade Settings ══════"
 input double   Risk_Percent      = 1.0;        // Risk per trade (% of balance) = SL distance
@@ -52,23 +52,11 @@ struct TradeInfo
 //+------------------------------------------------------------------+
 //| Global Variables                                                   |
 //+------------------------------------------------------------------+
-
 int    g_handleEMAFast;
 int    g_handleEMASlow;
 CTrade g_trade;
 
-datetime g_lastBarTime  = 0;
-
-// Setup state machine
-int    g_pendingDir     = 0;   // 1 = buy setup active, -1 = sell setup active, 0 = idle
-int    g_phase          = 0;   // 0 = idle, 1 = searching for pullback candle A, 2 = waiting for reclaim candle B
-int    g_barsInSearch   = 0;   // candles counted while searching for candle A
-double g_candleA_low    = 0.0; // low of pullback candle (buy)
-double g_candleA_high   = 0.0; // high of pullback candle (sell)
-double g_pbOpen         = 0.0; // pullback candle open  (for on-chart verification label)
-double g_pbClose        = 0.0; // pullback candle close (for on-chart verification label)
-double g_pbEma9         = 0.0; // EMA9 at pullback candle (for on-chart verification label)
-int    g_pbBar          = 0;   // which candle after the cross the pullback was (1 = first after cross)
+datetime g_lastBarTime = 0;
 
 TradeInfo g_trades[];
 int       g_tradeCount = 0;
@@ -90,13 +78,11 @@ int OnInit()
    g_trade.SetExpertMagicNumber(Magic_Number);
    g_trade.SetDeviationInPoints(Max_Slippage);
 
-   g_pendingDir  = 0;
-   g_phase       = 0;
-   g_tradeCount  = 0;
+   g_tradeCount = 0;
    ArrayResize(g_trades, 0);
 
-   Print("EMA Crossover EA v3.8 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
-         " | Search window: ", Search_Start, "-", Search_Window, " candles",
+   Print("EMA Crossover EA v3.9 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+         " | Pullback allowed candles 2-", Max_Pullback_Candle,
          " | Risk: ", DoubleToString(Risk_Percent, 2), "%",
          " | Buy: ", (Enable_Buy ? "ON" : "OFF"),
          " | Sell: ", (Enable_Sell ? "ON" : "OFF"),
@@ -116,7 +102,7 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                               |
+//| Expert tick function - runs once per new closed candle            |
 //+------------------------------------------------------------------+
 void OnTick()
 {
@@ -129,202 +115,192 @@ void OnTick()
       return;
    }
 
+   //--- Act only once per new bar (on the just-closed candle)
    datetime barTime = iTime(_Symbol, PERIOD_CURRENT, 0);
-   bool newBar = (barTime != g_lastBarTime);
-   if(!newBar) return;
+   if(barTime == g_lastBarTime) return;
    g_lastBarTime = barTime;
-
-   //--- Get indicator values (bar 1 = last closed candle)
-   double emaFast[3], emaSlow[3];
-   if(CopyBuffer(g_handleEMAFast, 0, 0, 3, emaFast) < 3) return;
-   if(CopyBuffer(g_handleEMASlow, 0, 0, 3, emaSlow) < 3) return;
-   ArraySetAsSeries(emaFast, true);
-   ArraySetAsSeries(emaSlow, true);
 
    //--- Manage open trades (candle-close stop)
    ManageOpenTrades();
    CleanupClosedTrades();
 
-   //--- Last closed candle OHLC
-   double o1 = iOpen(_Symbol,  PERIOD_CURRENT, 1);
-   double h1 = iHigh(_Symbol,  PERIOD_CURRENT, 1);
-   double l1 = iLow(_Symbol,   PERIOD_CURRENT, 1);
-   double c1 = iClose(_Symbol, PERIOD_CURRENT, 1);
-   double ema9 = emaSlow[1];
+   //--- How many EMA values we need: cross may be up to (Max_Pullback_Candle+1) bars back, +1 for the pre-cross bar
+   int need = Max_Pullback_Candle + 3;
+   double ema3[], ema9[];
+   ArraySetAsSeries(ema3, true);
+   ArraySetAsSeries(ema9, true);
+   if(CopyBuffer(g_handleEMAFast, 0, 0, need, ema3) < need) return;
+   if(CopyBuffer(g_handleEMASlow, 0, 0, need, ema9) < need) return;
 
-   //--- Detect EMA3/EMA9 cross on the just-closed candle
-   bool crossUp = (emaFast[2] <= emaSlow[2] && emaFast[1] >  emaSlow[1]);
-   bool crossDn = (emaFast[2] >= emaSlow[2] && emaFast[1] <  emaSlow[1]);
+   //--- Try the two patterns straight off the candles (bar 1 = last closed candle)
+   CheckBuy(ema3, ema9);
+   CheckSell(ema3, ema9);
 
-   //--- Only look for a NEW cross when idle. Once a setup is active we must
-   //    IGNORE re-crosses, because the pullback candle (which pushes price back
-   //    through EMA9) naturally makes the fast EMA re-cross - and that must NOT
-   //    flip or restart the setup, or the entry direction gets corrupted.
-   bool freshCross = false;
-   if(g_pendingDir == 0)
-   {
-      if(crossUp && Enable_Buy)
-      {
-         g_pendingDir   = 1;
-         g_phase        = 1;
-         g_barsInSearch = 0;
-         freshCross     = true;
-         Print(">>> EMA", EMA_Fast_Period, " crossed ABOVE EMA", EMA_Slow_Period, " -> looking for BUY pullback");
-      }
-      else if(crossDn && Enable_Sell)
-      {
-         g_pendingDir   = -1;
-         g_phase        = 1;
-         g_barsInSearch = 0;
-         freshCross     = true;
-         Print(">>> EMA", EMA_Fast_Period, " crossed BELOW EMA", EMA_Slow_Period, " -> looking for SELL pullback");
-      }
-   }
-
-   //--- Evaluate the pattern (skip the cross candle itself)
-   if(!freshCross && g_pendingDir != 0)
-      EvaluatePattern(o1, h1, l1, c1, ema9, emaFast[1]);
-
-   UpdateChartComment(emaFast[1], emaSlow[1]);
+   UpdateChartComment(ema3[1], ema9[1]);
 }
 
 //+------------------------------------------------------------------+
-//| Walk the pullback -> reclaim state machine                        |
+//| BUY pattern - all read directly from the last few candles         |
+//|  bar 1 = entry candle, bar 2 = pullback candle, cross a bit back  |
 //+------------------------------------------------------------------+
-void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9, double emaFastVal)
+void CheckBuy(const double &ema3[], const double &ema9[])
 {
-   if(!IsTradingTime())
+   if(!Enable_Buy) return;
+   if(One_Trade_At_A_Time && HasOpenPosition()) return;
+
+   double o1 = iOpen(_Symbol, PERIOD_CURRENT, 1);   // entry candle
+   double l1 = iLow(_Symbol,  PERIOD_CURRENT, 1);
+   double c1 = iClose(_Symbol,PERIOD_CURRENT, 1);
+   double o2 = iOpen(_Symbol, PERIOD_CURRENT, 2);   // pullback candle
+   double l2 = iLow(_Symbol,  PERIOD_CURRENT, 2);
+   double c2 = iClose(_Symbol,PERIOD_CURRENT, 2);
+
+   // 1) Entry candle = bullish reclaim: opens below EMA9, closes above EMA9
+   bool reclaim = (o1 < ema9[1] && c1 > ema9[1]);
+
+   // 2) Pullback candle = bearish: opens above EMA9, closes below EMA9
+   bool pullback = (c2 < o2 && o2 > ema9[2] && c2 < ema9[2]);
+
+   if(!reclaim || !pullback) return;
+
+   // 3) The most recent EMA3/EMA9 cross before the pullback must be a cross UP (bullish)
+   int crossBar = FindRecentCrossBar(ema3, ema9);
+   if(crossBar < 0) return;
+   bool bullishCross = (ema3[crossBar] > ema9[crossBar] && ema3[crossBar+1] <= ema9[crossBar+1]);
+   if(!bullishCross) return;
+
+   // 4) Optional trend filter
+   if(Trend_Filter && !(ema3[1] > ema9[1]))
    {
-      // still advance the search window so a stale setup expires naturally
+      if(Verbose_Log) Print("BUY skipped by trend filter (EMA3 not above EMA9)");
+      return;
    }
 
-   //================= BUY SETUP =================
-   if(g_pendingDir == 1)
+   if(!IsTradingTime()) return;
+
+   // Stop = lowest low of the pullback + entry candles; TP = same distance (1:1)
+   double sl   = MathMin(l1, l2);
+   double risk = c1 - sl;
+   if(risk <= 0) return;
+   double tp   = c1 + risk;
+
+   int enCand = crossBar;        // entry candle number (cross = candle 1)
+   int pbCand = crossBar - 1;    // pullback candle number
+
+   if(Verbose_Log)
+      Print(StringFormat("BUY: cross=cand1 PB=cand%d EN=cand%d | PB O=%.2f C=%.2f E9=%.2f | EN O=%.2f C=%.2f E9=%.2f",
+            pbCand, enCand, o2, c2, ema9[2], o1, c1, ema9[1]));
+
+   if(Draw_Markers)
    {
-      g_barsInSearch++;   // candles since cross (1 = first candle after the cross)
-
-      bool isPullback = (c1 < o1 && o1 > ema9 && c1 < ema9);  // bearish, opens above EMA9, closes below
-      bool isReclaim  = (o1 < ema9 && c1 > ema9);             // opens below EMA9, closes above
-
-      // 1) If a pullback is already pending, THIS candle is its reclaim attempt
-      if(g_phase == 2)
-      {
-         bool trendOK = (!Trend_Filter || emaFastVal > ema9);  // buy only with EMA3 above EMA9
-         if(isReclaim && trendOK)
-         {
-            if(Verbose_Log)
-               Print(StringFormat("BUY ENTRY | pullback[O=%.2f C=%.2f EMA9=%.2f] entry[O=%.2f C=%.2f EMA9=%.2f] EMA3=%.2f (EMA3>EMA9=%s)",
-                  g_pbOpen, g_pbClose, g_pbEma9, o1, c1, ema9, emaFastVal, (emaFastVal>ema9?"Y":"N")));
-            if(Draw_Markers)
-            {
-               DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), l1, OBJ_ARROW_UP, clrDodgerBlue); // buy entry candle
-               DrawLabel(iTime(_Symbol, PERIOD_CURRENT, 1), l1,
-                  StringFormat("cross=cand1 PB=cand%d EN=cand%d | PB O%.2f C%.2f E9=%.2f | EN O%.2f C%.2f E9=%.2f | EMA3=%.2f",
-                     g_pbBar+1, g_barsInSearch+1, g_pbOpen, g_pbClose, g_pbEma9, o1, c1, ema9, emaFastVal), clrWhite);
-            }
-            double slLevel  = MathMin(g_candleA_low, l1);  // lowest low of the two candles
-            double riskDist = c1 - slLevel;                // reclaim close - lowest low
-            double tp       = c1 + riskDist;               // 1:1 reward
-            if(riskDist > 0 && IsTradingTime())
-               ExecuteBuy(slLevel, tp, riskDist);
-            else if(Verbose_Log)
-               Print(StringFormat("BUY entry blocked: riskDist=%.2f tradingTime=%s", riskDist, (IsTradingTime()?"Y":"N")));
-            ResetSetup();
-            return;
-         }
-         // Reclaim failed (wrong shape or counter-trend) -> go back to searching,
-         // so a pullback on a LATER candle within the window is not ignored.
-         if(Verbose_Log)
-            Print(StringFormat("BUY reclaim not taken (isReclaim=%s trendOK=%s) -> keep searching within window",
-               (isReclaim?"Y":"N"), (trendOK?"Y":"N")));
-         g_phase = 1;
-      }
-
-      // 2) Look for a (new) pullback candle - must leave room for the entry inside the window
-      if(g_phase == 1 && g_barsInSearch >= Search_Start && g_barsInSearch < Search_Window && isPullback)
-      {
-         g_candleA_low = l1;
-         g_pbOpen = o1;  g_pbClose = c1;  g_pbEma9 = ema9;  g_pbBar = g_barsInSearch;
-         g_phase = 2;
-         if(Verbose_Log)
-            Print(StringFormat("BUY pullback MATCH cand %d: O=%.2f C=%.2f EMA9=%.2f (open>EMA9 & close<EMA9) -> wait reclaim",
-               g_barsInSearch, o1, c1, ema9));
-         if(Draw_Markers)
-            DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), h1, OBJ_ARROW_DOWN, clrYellow); // pullback candle
-      }
-
-      // 3) Expire once the window is used up and we are not holding a pullback awaiting its reclaim
-      if(g_phase == 1 && g_barsInSearch >= Search_Window)
-      {
-         if(Verbose_Log) Print("BUY setup expired: no pullback/reclaim within window");
-         ResetSetup();
-      }
+      DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 2), iHigh(_Symbol, PERIOD_CURRENT, 2), OBJ_ARROW_DOWN, clrYellow);
+      DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), l1, OBJ_ARROW_UP, clrDodgerBlue);
+      DrawLabel(iTime(_Symbol, PERIOD_CURRENT, 1), l1,
+         StringFormat("cross=cand1 PB=cand%d EN=cand%d | PB O%.2f C%.2f E9=%.2f | EN O%.2f C%.2f E9=%.2f | EMA3=%.2f",
+            pbCand, enCand, o2, c2, ema9[2], o1, c1, ema9[1], ema3[1]), clrWhite);
    }
-   //================= SELL SETUP (mirror) =================
-   else if(g_pendingDir == -1)
-   {
-      g_barsInSearch++;   // candles since cross (1 = first candle after the cross)
 
-      bool isPullback = (c1 > o1 && o1 < ema9 && c1 > ema9);  // bullish, opens below EMA9, closes above
-      bool isReclaim  = (o1 > ema9 && c1 < ema9);             // opens above EMA9, closes below
-
-      // 1) If a pullback is already pending, THIS candle is its reclaim attempt
-      if(g_phase == 2)
-      {
-         bool trendOK = (!Trend_Filter || emaFastVal < ema9);  // sell only with EMA3 below EMA9
-         if(isReclaim && trendOK)
-         {
-            if(Verbose_Log)
-               Print(StringFormat("SELL ENTRY | pullback[O=%.2f C=%.2f EMA9=%.2f] entry[O=%.2f C=%.2f EMA9=%.2f] EMA3=%.2f (EMA3<EMA9=%s)",
-                  g_pbOpen, g_pbClose, g_pbEma9, o1, c1, ema9, emaFastVal, (emaFastVal<ema9?"Y":"N")));
-            if(Draw_Markers)
-            {
-               DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), h1, OBJ_ARROW_DOWN, clrRed); // sell entry candle
-               DrawLabel(iTime(_Symbol, PERIOD_CURRENT, 1), h1,
-                  StringFormat("cross=cand1 PB=cand%d EN=cand%d | PB O%.2f C%.2f E9=%.2f | EN O%.2f C%.2f E9=%.2f | EMA3=%.2f",
-                     g_pbBar+1, g_barsInSearch+1, g_pbOpen, g_pbClose, g_pbEma9, o1, c1, ema9, emaFastVal), clrWhite);
-            }
-            double slLevel  = MathMax(g_candleA_high, h1); // highest high of the two candles
-            double riskDist = slLevel - c1;                // highest high - reclaim close
-            double tp       = c1 - riskDist;               // 1:1 reward
-            if(riskDist > 0 && IsTradingTime())
-               ExecuteSell(slLevel, tp, riskDist);
-            else if(Verbose_Log)
-               Print(StringFormat("SELL entry blocked: riskDist=%.2f tradingTime=%s", riskDist, (IsTradingTime()?"Y":"N")));
-            ResetSetup();
-            return;
-         }
-         // Reclaim failed (wrong shape or counter-trend) -> go back to searching
-         if(Verbose_Log)
-            Print(StringFormat("SELL reclaim not taken (isReclaim=%s trendOK=%s) -> keep searching within window",
-               (isReclaim?"Y":"N"), (trendOK?"Y":"N")));
-         g_phase = 1;
-      }
-
-      // 2) Look for a (new) pullback candle - must leave room for the entry inside the window
-      if(g_phase == 1 && g_barsInSearch >= Search_Start && g_barsInSearch < Search_Window && isPullback)
-      {
-         g_candleA_high = h1;
-         g_pbOpen = o1;  g_pbClose = c1;  g_pbEma9 = ema9;  g_pbBar = g_barsInSearch;
-         g_phase = 2;
-         if(Verbose_Log)
-            Print(StringFormat("SELL pullback MATCH cand %d: O=%.2f C=%.2f EMA9=%.2f (open<EMA9 & close>EMA9) -> wait reclaim",
-               g_barsInSearch, o1, c1, ema9));
-         if(Draw_Markers)
-            DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), l1, OBJ_ARROW_UP, clrYellow); // pullback candle
-      }
-
-      // 3) Expire once the window is used up and we are not holding a pullback awaiting its reclaim
-      if(g_phase == 1 && g_barsInSearch >= Search_Window)
-      {
-         if(Verbose_Log) Print("SELL setup expired: no pullback/reclaim within window");
-         ResetSetup();
-      }
-   }
+   ExecuteBuy(sl, tp, risk);
 }
 
 //+------------------------------------------------------------------+
-//| Draw a marker arrow on a specific candle (for visual debugging)   |
+//| SELL pattern - mirror of buy                                       |
+//+------------------------------------------------------------------+
+void CheckSell(const double &ema3[], const double &ema9[])
+{
+   if(!Enable_Sell) return;
+   if(One_Trade_At_A_Time && HasOpenPosition()) return;
+
+   double o1 = iOpen(_Symbol, PERIOD_CURRENT, 1);   // entry candle
+   double h1 = iHigh(_Symbol, PERIOD_CURRENT, 1);
+   double c1 = iClose(_Symbol,PERIOD_CURRENT, 1);
+   double o2 = iOpen(_Symbol, PERIOD_CURRENT, 2);   // pullback candle
+   double h2 = iHigh(_Symbol, PERIOD_CURRENT, 2);
+   double c2 = iClose(_Symbol,PERIOD_CURRENT, 2);
+
+   // 1) Entry candle = bearish reclaim: opens above EMA9, closes below EMA9
+   bool reclaim = (o1 > ema9[1] && c1 < ema9[1]);
+
+   // 2) Pullback candle = bullish: opens below EMA9, closes above EMA9
+   bool pullback = (c2 > o2 && o2 < ema9[2] && c2 > ema9[2]);
+
+   if(!reclaim || !pullback) return;
+
+   // 3) The most recent EMA3/EMA9 cross before the pullback must be a cross DOWN (bearish)
+   int crossBar = FindRecentCrossBar(ema3, ema9);
+   if(crossBar < 0) return;
+   bool bearishCross = (ema3[crossBar] < ema9[crossBar] && ema3[crossBar+1] >= ema9[crossBar+1]);
+   if(!bearishCross) return;
+
+   // 4) Optional trend filter
+   if(Trend_Filter && !(ema3[1] < ema9[1]))
+   {
+      if(Verbose_Log) Print("SELL skipped by trend filter (EMA3 not below EMA9)");
+      return;
+   }
+
+   if(!IsTradingTime()) return;
+
+   double sl   = MathMax(h1, h2);
+   double risk = sl - c1;
+   if(risk <= 0) return;
+   double tp   = c1 - risk;
+
+   int enCand = crossBar;
+   int pbCand = crossBar - 1;
+
+   if(Verbose_Log)
+      Print(StringFormat("SELL: cross=cand1 PB=cand%d EN=cand%d | PB O=%.2f C=%.2f E9=%.2f | EN O=%.2f C=%.2f E9=%.2f",
+            pbCand, enCand, o2, c2, ema9[2], o1, c1, ema9[1]));
+
+   if(Draw_Markers)
+   {
+      DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 2), iLow(_Symbol, PERIOD_CURRENT, 2), OBJ_ARROW_UP, clrYellow);
+      DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), h1, OBJ_ARROW_DOWN, clrRed);
+      DrawLabel(iTime(_Symbol, PERIOD_CURRENT, 1), h1,
+         StringFormat("cross=cand1 PB=cand%d EN=cand%d | PB O%.2f C%.2f E9=%.2f | EN O%.2f C%.2f E9=%.2f | EMA3=%.2f",
+            pbCand, enCand, o2, c2, ema9[2], o1, c1, ema9[1], ema3[1]), clrWhite);
+   }
+
+   ExecuteSell(sl, tp, risk);
+}
+
+//+------------------------------------------------------------------+
+//| Find the bar index of the most recent EMA3/EMA9 cross that sits    |
+//| before the pullback candle. Pullback = bar 2, so a cross that      |
+//| makes the pullback "candle P" (P = 2..Max_Pullback_Candle) sits at |
+//| bar 3..(Max_Pullback_Candle+1). Returns -1 if none in range.       |
+//+------------------------------------------------------------------+
+int FindRecentCrossBar(const double &ema3[], const double &ema9[])
+{
+   for(int k = 3; k <= Max_Pullback_Candle + 1; k++)
+   {
+      bool crossedUp   = (ema3[k] > ema9[k] && ema3[k+1] <= ema9[k+1]);
+      bool crossedDown = (ema3[k] < ema9[k] && ema3[k+1] >= ema9[k+1]);
+      if(crossedUp || crossedDown)
+         return k;   // nearest cross to the pullback
+   }
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| Is there already an open position from this EA?                    |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 &&
+         PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         PositionGetInteger(POSITION_MAGIC) == Magic_Number)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Draw a marker arrow on a specific candle                           |
 //+------------------------------------------------------------------+
 void DrawArrow(datetime t, double price, ENUM_OBJECT type, color clr)
 {
@@ -352,18 +328,6 @@ void DrawLabel(datetime t, double price, string text, color clr)
 }
 
 //+------------------------------------------------------------------+
-//| Reset the setup state machine                                     |
-//+------------------------------------------------------------------+
-void ResetSetup()
-{
-   g_pendingDir   = 0;
-   g_phase        = 0;
-   g_barsInSearch = 0;
-   g_candleA_low  = 0.0;
-   g_candleA_high = 0.0;
-}
-
-//+------------------------------------------------------------------+
 //| Execute BUY trade                                                  |
 //+------------------------------------------------------------------+
 void ExecuteBuy(double slLevel, double tpLevel, double riskDist)
@@ -378,7 +342,6 @@ void ExecuteBuy(double slLevel, double tpLevel, double riskDist)
    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double tp    = NormalizeDouble(tpLevel, _Digits);
 
-   // TP as hard order level (broker closes when reached); SL handled on candle close by EA
    if(g_trade.Buy(lot, _Symbol, price, 0, tp, "EMA3/9 Reclaim Buy"))
    {
       ulong ticket = g_trade.ResultOrder();
@@ -427,7 +390,6 @@ void ManageOpenTrades()
 
    for(int i = g_tradeCount - 1; i >= 0; i--)
    {
-      // verify position still exists
       if(!PositionSelectByTicket(g_trades[i].ticket))
       {
          RemoveTrade(i);
@@ -589,15 +551,9 @@ void CloseAllTrades()
 //+------------------------------------------------------------------+
 void UpdateChartComment(double emaFastVal, double emaSlowVal)
 {
-   string setup = "Idle (waiting for EMA cross)";
-   if(g_pendingDir == 1)
-      setup = (g_phase == 1)
-              ? StringFormat("BUY: searching pullback %d (window %d-%d)", g_barsInSearch, Search_Start, Search_Window)
-              : "BUY: waiting for reclaim candle";
-   else if(g_pendingDir == -1)
-      setup = (g_phase == 1)
-              ? StringFormat("SELL: searching pullback %d (window %d-%d)", g_barsInSearch, Search_Start, Search_Window)
-              : "SELL: waiting for reclaim candle";
+   string align = (emaFastVal > emaSlowVal) ? "EMA3 above EMA9 (bullish)"
+                : (emaFastVal < emaSlowVal) ? "EMA3 below EMA9 (bearish)"
+                : "EMA3 = EMA9";
 
    string tradingStatus = IsTradingTime() ? "ACTIVE" : "PAUSED";
 
@@ -613,16 +569,16 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    }
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v3.8 ======\n"
-      "EMA %d: %.2f  |  EMA %d: %.2f\n"
+      "====== EMA Crossover EA v3.9 ======\n"
+      "EMA %d: %.2f  |  EMA %d: %.2f  (%s)\n"
       "Risk: %.2f%%  |  Buy:%s  Sell:%s  Trend filter:%s\n"
-      "Setup: %s\n"
+      "Pullback allowed: candle 2 to %d (cross = candle 1)\n"
       "Trading: %s%s\n"
       "===================================",
-      EMA_Fast_Period, emaFastVal, EMA_Slow_Period, emaSlowVal,
+      EMA_Fast_Period, emaFastVal, EMA_Slow_Period, emaSlowVal, align,
       Risk_Percent, (Enable_Buy ? "on" : "off"), (Enable_Sell ? "on" : "off"),
       (Trend_Filter ? "on" : "off"),
-      setup,
+      Max_Pullback_Candle,
       tradingStatus, tradeInfo
    ));
 }
