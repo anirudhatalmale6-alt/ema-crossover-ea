@@ -3,8 +3,8 @@
 //|                                          Copyright 2026            |
 //|        EMA 3/9 Cross + Pullback/Reclaim Pattern Entry             |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v3.3"
-#property version   "3.30"
+#property copyright "EMA Crossover EA v3.4"
+#property version   "3.40"
 #property description "EMA3 crosses EMA9, pullback candle through EMA9, reclaim candle = entry"
 #property description "Candle-close SL at 2-candle low/high, 1:1 TP, percentage-risk sizing"
 
@@ -94,7 +94,7 @@ int OnInit()
    g_tradeCount  = 0;
    ArrayResize(g_trades, 0);
 
-   Print("EMA Crossover EA v3.3 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+   Print("EMA Crossover EA v3.4 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | Search window: ", Search_Start, "-", Search_Window, " candles",
          " | Risk: ", DoubleToString(Risk_Percent, 2), "%",
          " | Buy: ", (Enable_Buy ? "ON" : "OFF"),
@@ -212,14 +212,14 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9, do
          if(isReclaim && trendOK)
          {
             if(Verbose_Log)
-               Print(StringFormat("BUY ENTRY | pullback[O=%.2f C=%.2f EMA9=%.2f] entry[O=%.2f C=%.2f EMA9=%.2f]",
-                  g_pbOpen, g_pbClose, g_pbEma9, o1, c1, ema9));
+               Print(StringFormat("BUY ENTRY | pullback[O=%.2f C=%.2f EMA9=%.2f] entry[O=%.2f C=%.2f EMA9=%.2f] EMA3=%.2f (EMA3>EMA9=%s)",
+                  g_pbOpen, g_pbClose, g_pbEma9, o1, c1, ema9, emaFastVal, (emaFastVal>ema9?"Y":"N")));
             if(Draw_Markers)
             {
                DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), l1, OBJ_ARROW_UP, clrDodgerBlue); // buy entry candle
                DrawLabel(iTime(_Symbol, PERIOD_CURRENT, 1), l1,
-                  StringFormat("PB O%.2f C%.2f E%.2f | EN O%.2f C%.2f E%.2f",
-                     g_pbOpen, g_pbClose, g_pbEma9, o1, c1, ema9), clrWhite);
+                  StringFormat("PB O%.2f C%.2f E9=%.2f | EN O%.2f C%.2f E9=%.2f | EMA3=%.2f",
+                     g_pbOpen, g_pbClose, g_pbEma9, o1, c1, ema9, emaFastVal), clrWhite);
             }
             double slLevel  = MathMin(g_candleA_low, l1);  // lowest low of the two candles
             double riskDist = c1 - slLevel;                // reclaim close - lowest low
@@ -274,14 +274,14 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9, do
          if(isReclaim && trendOK)
          {
             if(Verbose_Log)
-               Print(StringFormat("SELL ENTRY | pullback[O=%.2f C=%.2f EMA9=%.2f] entry[O=%.2f C=%.2f EMA9=%.2f]",
-                  g_pbOpen, g_pbClose, g_pbEma9, o1, c1, ema9));
+               Print(StringFormat("SELL ENTRY | pullback[O=%.2f C=%.2f EMA9=%.2f] entry[O=%.2f C=%.2f EMA9=%.2f] EMA3=%.2f (EMA3<EMA9=%s)",
+                  g_pbOpen, g_pbClose, g_pbEma9, o1, c1, ema9, emaFastVal, (emaFastVal<ema9?"Y":"N")));
             if(Draw_Markers)
             {
                DrawArrow(iTime(_Symbol, PERIOD_CURRENT, 1), h1, OBJ_ARROW_DOWN, clrRed); // sell entry candle
                DrawLabel(iTime(_Symbol, PERIOD_CURRENT, 1), h1,
-                  StringFormat("PB O%.2f C%.2f E%.2f | EN O%.2f C%.2f E%.2f",
-                     g_pbOpen, g_pbClose, g_pbEma9, o1, c1, ema9), clrWhite);
+                  StringFormat("PB O%.2f C%.2f E9=%.2f | EN O%.2f C%.2f E9=%.2f | EMA3=%.2f",
+                     g_pbOpen, g_pbClose, g_pbEma9, o1, c1, ema9, emaFastVal), clrWhite);
             }
             double slLevel  = MathMax(g_candleA_high, h1); // highest high of the two candles
             double riskDist = slLevel - c1;                // highest high - reclaim close
@@ -612,7 +612,7 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    }
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v3.3 ======\n"
+      "====== EMA Crossover EA v3.4 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
       "Risk: %.2f%%  |  Buy:%s  Sell:%s  Trend filter:%s\n"
       "Setup: %s\n"
