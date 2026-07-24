@@ -3,8 +3,8 @@
 //|                                          Copyright 2026            |
 //|        EMA 3/9 Cross + Pullback/Reclaim Pattern Entry             |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v2.5"
-#property version   "2.50"
+#property copyright "EMA Crossover EA v2.6"
+#property version   "2.60"
 #property description "EMA3 crosses EMA9, pullback candle through EMA9, reclaim candle = entry"
 #property description "Candle-close SL at 2-candle low/high, 1:1 TP, percentage-risk sizing"
 
@@ -17,10 +17,11 @@
 input group "══════ EMA / Pattern Settings ══════"
 input int      EMA_Fast_Period   = 3;          // EMA Fast Period (crosses)
 input int      EMA_Slow_Period   = 9;          // EMA Slow Period (reference)
-input int      Search_Start      = 2;          // First candle after cross to look at (e.g. 2 = skip 1st)
-input int      Search_Window     = 3;          // Last candle after cross to find pullback candle
+input int      Search_Start      = 1;          // First candle after cross to look for pullback (1 = candle right after cross)
+input int      Search_Window     = 3;          // Last candle after cross to look for pullback
 input bool     Enable_Buy        = true;       // Enable Buy setups
 input bool     Enable_Sell       = true;       // Enable Sell setups (mirror of buy)
+input bool     Verbose_Log       = true;       // Print each pullback/reclaim check to Experts log
 
 input group "══════ Risk / Trade Settings ══════"
 input double   Risk_Percent      = 1.0;        // Risk per trade (% of balance) = SL distance
@@ -88,7 +89,7 @@ int OnInit()
    g_tradeCount  = 0;
    ArrayResize(g_trades, 0);
 
-   Print("EMA Crossover EA v2.5 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+   Print("EMA Crossover EA v2.6 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | Search window: ", Search_Start, "-", Search_Window, " candles",
          " | Risk: ", DoubleToString(Risk_Percent, 2), "%",
          " | Buy: ", (Enable_Buy ? "ON" : "OFF"),
@@ -196,9 +197,15 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
             return;
          }
          if(g_barsInSearch < Search_Start)
-            return;       // ignore candles before the search start (e.g. the 1st candle)
+            return;       // ignore candles before the search start
          // Candle A (pullback): bearish, opens above EMA9, closes below EMA9
-         if(c1 < o1 && o1 > ema9 && c1 < ema9)
+         bool isPullback = (c1 < o1 && o1 > ema9 && c1 < ema9);
+         if(Verbose_Log)
+            Print(StringFormat("BUY pullback chk (cand %d after cross): O=%.2f C=%.2f EMA9=%.2f | bearish=%s openAbove=%s closeBelow=%s -> %s",
+               g_barsInSearch, o1, c1, ema9,
+               (c1<o1?"Y":"N"), (o1>ema9?"Y":"N"), (c1<ema9?"Y":"N"),
+               (isPullback?"MATCH -> wait reclaim":"no")));
+         if(isPullback)
          {
             g_candleA_low = l1;
             g_phase = 2;
@@ -206,13 +213,20 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
       }
       else if(g_phase == 2)  // the very next candle must reclaim: open below EMA9, close above EMA9
       {
-         if(o1 < ema9 && c1 > ema9)
+         bool isReclaim = (o1 < ema9 && c1 > ema9);
+         if(Verbose_Log)
+            Print(StringFormat("BUY reclaim chk: O=%.2f C=%.2f EMA9=%.2f | openBelow=%s closeAbove=%s -> %s",
+               o1, c1, ema9, (o1<ema9?"Y":"N"), (c1>ema9?"Y":"N"),
+               (isReclaim?"ENTRY":"no reclaim -> reset")));
+         if(isReclaim)
          {
             double slLevel  = MathMin(g_candleA_low, l1);  // lowest low of the two candles
             double riskDist = c1 - slLevel;                // second candle close - lowest low
             double tp       = c1 + riskDist;               // 1:1 reward
             if(riskDist > 0 && IsTradingTime())
                ExecuteBuy(slLevel, tp, riskDist);
+            else if(Verbose_Log)
+               Print(StringFormat("BUY entry blocked: riskDist=%.2f tradingTime=%s", riskDist, (IsTradingTime()?"Y":"N")));
          }
          ResetSetup(); // reclaim candle is the decider either way
       }
@@ -229,9 +243,15 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
             return;
          }
          if(g_barsInSearch < Search_Start)
-            return;       // ignore candles before the search start (e.g. the 1st candle)
+            return;       // ignore candles before the search start
          // Candle A (pullback): bullish, opens below EMA9, closes above EMA9
-         if(c1 > o1 && o1 < ema9 && c1 > ema9)
+         bool isPullback = (c1 > o1 && o1 < ema9 && c1 > ema9);
+         if(Verbose_Log)
+            Print(StringFormat("SELL pullback chk (cand %d after cross): O=%.2f C=%.2f EMA9=%.2f | bullish=%s openBelow=%s closeAbove=%s -> %s",
+               g_barsInSearch, o1, c1, ema9,
+               (c1>o1?"Y":"N"), (o1<ema9?"Y":"N"), (c1>ema9?"Y":"N"),
+               (isPullback?"MATCH -> wait reclaim":"no")));
+         if(isPullback)
          {
             g_candleA_high = h1;
             g_phase = 2;
@@ -239,13 +259,20 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
       }
       else if(g_phase == 2)  // reclaim: open above EMA9, close below EMA9
       {
-         if(o1 > ema9 && c1 < ema9)
+         bool isReclaim = (o1 > ema9 && c1 < ema9);
+         if(Verbose_Log)
+            Print(StringFormat("SELL reclaim chk: O=%.2f C=%.2f EMA9=%.2f | openAbove=%s closeBelow=%s -> %s",
+               o1, c1, ema9, (o1>ema9?"Y":"N"), (c1<ema9?"Y":"N"),
+               (isReclaim?"ENTRY":"no reclaim -> reset")));
+         if(isReclaim)
          {
             double slLevel  = MathMax(g_candleA_high, h1); // highest high of the two candles
             double riskDist = slLevel - c1;                // highest high - second candle close
             double tp       = c1 - riskDist;               // 1:1 reward
             if(riskDist > 0 && IsTradingTime())
                ExecuteSell(slLevel, tp, riskDist);
+            else if(Verbose_Log)
+               Print(StringFormat("SELL entry blocked: riskDist=%.2f tradingTime=%s", riskDist, (IsTradingTime()?"Y":"N")));
          }
          ResetSetup();
       }
@@ -514,7 +541,7 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    }
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v2.5 ======\n"
+      "====== EMA Crossover EA v2.6 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
       "Risk: %.2f%%  |  Buy:%s  Sell:%s\n"
       "Setup: %s\n"
