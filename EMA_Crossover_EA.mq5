@@ -3,8 +3,8 @@
 //|                                          Copyright 2026            |
 //|        EMA 3/9 Cross + Pullback/Reclaim Pattern Entry             |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v3.2"
-#property version   "3.20"
+#property copyright "EMA Crossover EA v3.3"
+#property version   "3.30"
 #property description "EMA3 crosses EMA9, pullback candle through EMA9, reclaim candle = entry"
 #property description "Candle-close SL at 2-candle low/high, 1:1 TP, percentage-risk sizing"
 
@@ -21,7 +21,7 @@ input int      Search_Start      = 1;          // First candle after cross to lo
 input int      Search_Window     = 3;          // Last candle after cross to look for pullback
 input bool     Enable_Buy        = true;       // Enable Buy setups
 input bool     Enable_Sell       = true;       // Enable Sell setups (mirror of buy)
-input bool     Trend_Filter      = false;      // OPTIONAL: only buy if EMA3>EMA9 at entry / sell if EMA3<EMA9 (off = pure pattern)
+input bool     Trend_Filter      = true;       // Buy only while EMA3>EMA9, sell only while EMA3<EMA9 (stops back-to-front entries)
 input bool     Verbose_Log       = true;       // Print each pullback/reclaim check to Experts log
 input bool     Draw_Markers      = true;       // Draw pullback (yellow) and entry (blue/red) arrows on chart
 
@@ -94,7 +94,7 @@ int OnInit()
    g_tradeCount  = 0;
    ArrayResize(g_trades, 0);
 
-   Print("EMA Crossover EA v3.2 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+   Print("EMA Crossover EA v3.3 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | Search window: ", Search_Start, "-", Search_Window, " candles",
          " | Risk: ", DoubleToString(Risk_Percent, 2), "%",
          " | Buy: ", (Enable_Buy ? "ON" : "OFF"),
@@ -612,14 +612,15 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    }
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v3.2 ======\n"
+      "====== EMA Crossover EA v3.3 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
-      "Risk: %.2f%%  |  Buy:%s  Sell:%s\n"
+      "Risk: %.2f%%  |  Buy:%s  Sell:%s  Trend filter:%s\n"
       "Setup: %s\n"
       "Trading: %s%s\n"
       "===================================",
       EMA_Fast_Period, emaFastVal, EMA_Slow_Period, emaSlowVal,
       Risk_Percent, (Enable_Buy ? "on" : "off"), (Enable_Sell ? "on" : "off"),
+      (Trend_Filter ? "on" : "off"),
       setup,
       tradingStatus, tradeInfo
    ));
