@@ -3,8 +3,8 @@
 //|                                          Copyright 2026            |
 //|        EMA 3/9 Cross + Pullback/Reclaim Pattern Entry             |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v2.2"
-#property version   "2.20"
+#property copyright "EMA Crossover EA v2.3"
+#property version   "2.30"
 #property description "EMA3 crosses EMA9, pullback candle through EMA9, reclaim candle = entry"
 #property description "Candle-close SL at 2-candle low/high, 1:1 TP, percentage-risk sizing"
 
@@ -17,7 +17,8 @@
 input group "══════ EMA / Pattern Settings ══════"
 input int      EMA_Fast_Period   = 3;          // EMA Fast Period (crosses)
 input int      EMA_Slow_Period   = 9;          // EMA Slow Period (reference)
-input int      Search_Window     = 3;          // Candles after cross to find pullback candle
+input int      Search_Start      = 2;          // First candle after cross to look at (e.g. 2 = skip 1st)
+input int      Search_Window     = 3;          // Last candle after cross to find pullback candle
 input bool     Enable_Buy        = true;       // Enable Buy setups
 input bool     Enable_Sell       = true;       // Enable Sell setups (mirror of buy)
 
@@ -87,8 +88,8 @@ int OnInit()
    g_tradeCount  = 0;
    ArrayResize(g_trades, 0);
 
-   Print("EMA Crossover EA v2.2 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
-         " | Search window: ", Search_Window, " candles",
+   Print("EMA Crossover EA v2.3 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+         " | Search window: ", Search_Start, "-", Search_Window, " candles",
          " | Risk: ", DoubleToString(Risk_Percent, 2), "%",
          " | Buy: ", (Enable_Buy ? "ON" : "OFF"),
          " | Sell: ", (Enable_Sell ? "ON" : "OFF"),
@@ -194,6 +195,8 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
             ResetSetup(); // no pullback candle within window
             return;
          }
+         if(g_barsInSearch < Search_Start)
+            return;       // ignore candles before the search start (e.g. the 1st candle)
          // Candle A: bearish, opens above EMA9, closes below EMA9
          if(c1 < o1 && o1 > ema9 && c1 < ema9)
          {
@@ -225,6 +228,8 @@ void EvaluatePattern(double o1, double h1, double l1, double c1, double ema9)
             ResetSetup();
             return;
          }
+         if(g_barsInSearch < Search_Start)
+            return;       // ignore candles before the search start (e.g. the 1st candle)
          // Candle A: bullish, opens below EMA9, closes above EMA9
          if(c1 > o1 && o1 < ema9 && c1 > ema9)
          {
@@ -488,11 +493,11 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    string setup = "Idle (waiting for EMA cross)";
    if(g_pendingDir == 1)
       setup = (g_phase == 1)
-              ? StringFormat("BUY: searching pullback %d/%d", g_barsInSearch, Search_Window)
+              ? StringFormat("BUY: searching pullback %d (window %d-%d)", g_barsInSearch, Search_Start, Search_Window)
               : "BUY: waiting for reclaim candle";
    else if(g_pendingDir == -1)
       setup = (g_phase == 1)
-              ? StringFormat("SELL: searching pullback %d/%d", g_barsInSearch, Search_Window)
+              ? StringFormat("SELL: searching pullback %d (window %d-%d)", g_barsInSearch, Search_Start, Search_Window)
               : "SELL: waiting for reclaim candle";
 
    string tradingStatus = IsTradingTime() ? "ACTIVE" : "PAUSED";
@@ -509,7 +514,7 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    }
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v2.2 ======\n"
+      "====== EMA Crossover EA v2.3 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f\n"
       "Risk: %.2f%%  |  Buy:%s  Sell:%s\n"
       "Setup: %s\n"
