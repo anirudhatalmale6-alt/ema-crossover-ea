@@ -3,10 +3,10 @@
 //|                                          Copyright 2026            |
 //|        EMA 3/9 Cross + Pullback/Reclaim Pattern Entry             |
 //+------------------------------------------------------------------+
-#property copyright "EMA Crossover EA v4.0"
-#property version   "4.00"
+#property copyright "EMA Crossover EA v4.1"
+#property version   "4.10"
 #property description "EMA3 crosses EMA9 -> watch the next candles -> pullback then reclaim = entry"
-#property description "Forward candle tracker: direction is LOCKED at the cross (a buy cross can only buy)"
+#property description "Forward candle tracker: a REAL opposite cross voids the setup (no buy on a sell cross)"
 
 #include <Trade\Trade.mqh>
 
@@ -90,7 +90,7 @@ int OnInit()
    ArrayResize(g_trades, 0);
    ResetSetup();
 
-   Print("EMA Crossover EA v4.0 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
+   Print("EMA Crossover EA v4.1 initialized | EMA ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | Pullback allowed candles 2-", Max_Pullback_Candle,
          " | Risk: ", DoubleToString(Risk_Percent, 2), "%",
          " | Buy: ", (Enable_Buy ? "ON" : "OFF"),
@@ -192,9 +192,28 @@ void DetectCross(const double &ema3[], const double &ema9[])
 void AdvanceSetup(const double &ema3[], const double &ema9[],
                   double o1, double c1, double h1, double l1)
 {
+   int dir = g_setupDir;
+
+   //--- GUARD: a GENUINE opposite cross voids this setup ------------------------
+   //  A shallow pullback keeps the fast EMA on its original side (EMA3 stays
+   //  above EMA9 for a buy), so real setups survive.  But if EMA3 crosses fully
+   //  to the OTHER side, the market has actually flipped - that is a real
+   //  bearish (or bullish) cross, not a pullback.  Killing the setup here is
+   //  what stops "buy on a sell cross".  We re-arm the new direction from this
+   //  very candle so no signal is lost.
+   bool oppCross = (dir == +1) ? (ema3[1] < ema9[1] && ema3[2] >= ema9[2])
+                               : (ema3[1] > ema9[1] && ema3[2] <= ema9[2]);
+   if(oppCross)
+   {
+      if(Verbose_Log) Print((dir==+1?"BUY":"SELL"), " setup voided: EMA3 crossed the OTHER way (real ",
+                            (dir==+1?"bearish":"bullish"), " cross) -> re-arming opposite direction");
+      ResetSetup();
+      DetectCross(ema3, ema9);     // arm the opposite direction from this same candle
+      return;
+   }
+
    g_barsSinceCross++;             // this just-closed candle is candle g_barsSinceCross
    double e9 = ema9[1];
-   int    dir = g_setupDir;
 
    // What this candle looks like relative to EMA9
    bool isPullback = (dir == +1) ? (o1 > e9 && c1 < e9)    // BUY  pullback: opens ABOVE, closes BELOW (bearish through EMA9)
@@ -248,6 +267,16 @@ void AdvanceSetup(const double &ema3[], const double &ema9[],
    if(!g_pullbackDone && g_barsSinceCross >= Max_Pullback_Candle)
    {
       if(Verbose_Log) Print("No pullback by candle ", Max_Pullback_Candle, " -> reset, waiting for next cross");
+      ResetSetup();
+      return;
+   }
+
+   // --- Absolute cap: the whole pattern must finish inside the window.
+   //     Pullback by candle Max_Pullback_Candle, reclaim the candle right after.
+   //     A pullback with no reclaim by then is stale chop -> reset. ---
+   if(g_barsSinceCross >= Max_Pullback_Candle + 1)
+   {
+      if(Verbose_Log) Print("Pullback got no reclaim inside the window (candle ", g_barsSinceCross, ") -> reset");
       ResetSetup();
    }
 }
@@ -614,7 +643,7 @@ void UpdateChartComment(double emaFastVal, double emaSlowVal)
    }
 
    Comment(StringFormat(
-      "====== EMA Crossover EA v4.0 ======\n"
+      "====== EMA Crossover EA v4.1 ======\n"
       "EMA %d: %.2f  |  EMA %d: %.2f  (%s)\n"
       "Risk: %.2f%%  |  Buy:%s  Sell:%s  Trend filter:%s\n"
       "Pullback allowed: candle 2 to %d (cross = candle 1)\n"
